@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.4.0 — AudioMuse-AI 3.2–3.4 support
+
+AudioMuse-AI 3.2 replaced Redis/RQ with a task queue living in Postgres, and
+3.3.1 moved the core to numpy 2 and librosa 1.0. Both landed inside APIs this
+plugin builds on. Everything below still works on 2.6.2 and every 3.x.
+
+### The queue rewrite (core 3.2)
+
+- **Scan task rows follow the core's id again.** `jobs._rq_task_id()` read the
+  running RQ job's id; `rq` is not installed from 3.2, so it returned `None` and
+  every scan invented a uuid instead. That left a second row in Active Tasks
+  beside the queue's own, made the Cancel button tombstone a row nothing was
+  polling (so cancelling a scan no longer stopped it launching more albums), and
+  produced a `func IS NULL` row exposed to the core's stale-row sweep. Replaced
+  by `jobs._current_task_id()`, which asks `taskqueue.current_task_id()` first
+  and falls back to the RQ job id on older cores.
+- **Lost album jobs are detected again.** `enqueue()` returns a task-id string
+  on 3.2+ where it used to return an RQ `Job`, so the `job.get_status()` probe
+  raised `AttributeError` into a bare `except` and silently never fired: a scan
+  whose worker died drained forever waiting on a child that would never report.
+  `_child_job_lost` now polls the child's queue row on 3.2+ and keeps the RQ
+  path for older cores.
+- **A long backlog no longer ends a scan early.** The core fails any live task
+  row it does not own once it has gone 30 minutes without an update. Album child
+  rows are written once at launch, so a child waiting behind a big library was
+  failed out from under the parent, counted done, and the scan reported finished
+  while the album was still queued. `_touch_live_children` refreshes the rows
+  that actually approach the deadline.
+- **Buttons explain a busy queue instead of returning 500.** From 3.2 the core
+  refuses a plugin enqueue issued from the web process while another queue job
+  is running. Scan, Re-analyze, Deep analyze, the bulk actions and Re-analyze
+  album now report that and stop, and the deep-scan buttons undo the
+  "deep scan queued" tag they had already written, so a refused click can no
+  longer leave a track stuck until the orphan-recovery TTL. Force-requeue only
+  bumps `deep_pending_since` for rows that actually reached the queue, so a row
+  it could not queue stays visible to the recovery cron.
+
+### The dependency bump (core 3.3.1)
+
+- **Deep scans of m4a/mp4/ALAC/opus/wma work again.** librosa 1.0 removed the
+  audioread backend, so `librosa.load` reads only what libsndfile can open.
+  Normal scans already had an ffmpeg tier for those containers; deep scans had
+  none and died on their first chunk — a deep scan of an ALAC `.m4a` came back
+  INCONCLUSIVE. Both the deep scan and the single-window fallback now fall back
+  to ffmpeg. The fallback is deliberately limited to containers libsndfile
+  cannot open at all: for a corrupt FLAC, the decode failure is the finding, and
+  ffmpeg decoding its intact prefix would launder that into a verdict.
+- **matplotlib floor raised to `>=3.10`** for the core's numpy 2.4.6. matplotlib
+  3.8's C extensions are built against the numpy 1.x ABI and fail to import
+  under numpy 2, and pip does not upgrade an already-satisfied requirement.
+
+### Also
+
+- Album and library overviews gained a **max confidence %** filter alongside the
+  existing minimum, and every verdict chip now shows how many tracks match it.
+
 ## 0.3.1
 
 - Self-healing provider-id backfill: library and album scans re-run the

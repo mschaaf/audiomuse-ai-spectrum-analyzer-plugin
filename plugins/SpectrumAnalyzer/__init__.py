@@ -22,7 +22,7 @@ from flask import Blueprint, request, redirect, url_for
 
 from plugin.api import (
     get_db, get_setting, set_setting, table, render_page, manage_plugins_url,
-    enqueue,
+    enqueue, logger,
 )
 
 from . import jobs
@@ -186,6 +186,85 @@ def _esc(v):
     return html.escape('' if v is None else str(v))
 
 
+# ------------------------------------------------------------ queue guard --
+
+class _QueueRefused(Exception):
+    """The core would not take our work onto the queue right now."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+
+
+def _enqueue(*args, **kwargs):
+    """`enqueue()`, with a refusal turned into something a route can render.
+
+    From 3.2 the core refuses a plugin enqueue issued from the web process
+    while ANY queue job is live — a core analysis, a cleaning run, another
+    plugin's task, or one of our own scans — and raises. Unhandled that is a
+    500 on a button click, so every route queues through here. A job already
+    running on a worker is exempt (it holds the guard), which is why the
+    parent scan can still fan its album children out from inside itself.
+    """
+    try:
+        enqueue(*args, **kwargs)
+    except Exception as exc:
+        logger.warning('spectrum_analyzer: the core refused to queue our task: %s', exc)
+        raise _QueueRefused(getattr(exc, 'user_message', None) or str(exc)) from exc
+
+
+def _enqueue_tracks(item_ids, deep=False, queue='default'):
+    """Queue one analyze_track_job per id, stopping at the first refusal.
+
+    Returns (queued, not_queued, refusal). A refusal describes the queue, not
+    the track, so once one id is refused every later one would be too: stop,
+    and hand the rest back so the caller can undo whatever it staged for them.
+    """
+    queued, pending = [], list(item_ids)
+    while pending:
+        try:
+            _enqueue(jobs.analyze_track_job, pending[0], deep=deep, queue=queue)
+        except _QueueRefused as exc:
+            return queued, pending, exc
+        queued.append(pending.pop(0))
+    return queued, [], None
+
+
+def _untag_deep_pending(item_ids):
+    """Drop the "deep scan queued" tag from rows whose scan never got queued.
+
+    The routes tag first so the page updates immediately, and the tag is what
+    makes the button idempotent — so a tag left behind by a refused enqueue
+    would block the track until the orphan-recovery TTL expires.
+    """
+    item_ids = [i for i in item_ids if i]
+    if not item_ids:
+        return
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute('UPDATE ' + table('results') +
+                    ' SET deep_pending=FALSE, deep_pending_since=NULL'
+                    ' WHERE item_id = ANY(%s)', (item_ids,))
+        db.commit()
+        cur.close()
+    except Exception:
+        logger.exception('spectrum_analyzer: could not clear deep_pending after a refusal')
+
+
+def _queue_refused_page(refusal, back_url=None):
+    """A 409 page explaining that nothing was queued, instead of a 500."""
+    back = back_url or request.referrer or url_for('spectrum_analyzer.home')
+    return render_page(
+        '<p style="color:#b45309;font-weight:600;">Nothing was queued.</p>'
+        f'<p>{_esc(refusal.message)}</p>'
+        '<p style="font-size:.9rem;color:#6b7280;">AudioMuse-AI runs one queue '
+        'job at a time. Wait for the running task to finish, or cancel it under '
+        'Active Tasks, then try again.</p>'
+        f'<p><a href="{_esc(back)}">Back</a></p>',
+        title='Spectrum Analyzer'), 409
+
+
 def _badge(verdict, confidence=None):
     color, label = VERDICT_STYLE.get(verdict, ('#6b7280', verdict or '?'))
     conf = f' {int(confidence * 100)}%' if confidence is not None else ''
@@ -219,6 +298,10 @@ def home():
         min_conf = max(0, min(100, int(request.args.get('min_conf', 0) or 0)))
     except ValueError:
         min_conf = 0
+    try:
+        max_conf = max(0, min(100, int(request.args.get('max_conf', 0) or 0)))
+    except ValueError:
+        max_conf = 0
     per_page = 100
 
     # manually verified tracks never count as suspect or lowpassed
@@ -234,6 +317,25 @@ def home():
         ' COUNT(*) FILTER (WHERE verified),'
         ' COUNT(DISTINCT album) FROM ' + tbl, (SUSPECT_VERDICTS,))
     total, suspects, n_lowpassed, n_inconclusive, n_verified, n_albums = cur.fetchone()
+
+    # per-status counts for the filter UI (respecting search and confidence/unverified filters)
+    count_where = []
+    count_params = []
+    if q:
+        count_where.append('(album ILIKE %s OR artist ILIKE %s OR title ILIKE %s)')
+        count_params += [f'%{q}%'] * 3
+    if unverified_only:
+        count_where.append('NOT verified')
+    if min_conf:
+        count_where.append('confidence >= %s')
+        count_params.append(min_conf / 100.0)
+    if max_conf:
+        count_where.append('confidence <= %s')
+        count_params.append(max_conf / 100.0)
+    count_sql = (' WHERE ' + ' AND '.join(count_where)) if count_where else ''
+    cur.execute('SELECT verdict, COUNT(*) FROM ' + tbl + count_sql + ' GROUP BY verdict',
+                tuple(count_params))
+    counts = dict(cur.fetchall())
 
     having = []
     having_params = []
@@ -256,6 +358,12 @@ def home():
         cond = 'confidence >= %s' + (' AND NOT verified' if unverified_only else '')
         having.append('COUNT(*) FILTER (WHERE ' + cond + ') > 0')
         having_params.append(min_conf / 100.0)
+    if max_conf:
+        # albums containing at least one song whose verdict confidence
+        # is at most this percentage
+        cond = 'confidence <= %s' + (' AND NOT verified' if unverified_only else '')
+        having.append('COUNT(*) FILTER (WHERE ' + cond + ') > 0')
+        having_params.append(max_conf / 100.0)
     if verified_only:
         having.append('COUNT(*) FILTER (WHERE verified) > 0')
     having_sql = (' HAVING ' + ' AND '.join(having)) if having else ''
@@ -370,7 +478,7 @@ def home():
         for album, count, bad, low, ver, pending, min_cut, last in rows)
 
     def page_url(p):
-        params = {'q': q, 'min_bad': min_bad, 'min_conf': min_conf, 'p': p, 'v': sel_verdicts}
+        params = {'q': q, 'min_bad': min_bad, 'min_conf': min_conf, 'max_conf': max_conf, 'p': p, 'v': sel_verdicts}
         if verified_only:
             params['verified'] = 1
         if unverified_only:
@@ -410,6 +518,10 @@ def home():
         f'least one track whose verdict confidence is at least this percentage">'
         f'min confidence % <input type="number" name="min_conf" min="0" max="100" '
         f'value="{min_conf}" style="width:4rem;"></label>'
+        f'<label style="white-space:nowrap;margin-left:.6rem;" title="Show only albums containing at '
+        f'least one track whose verdict confidence is at most this percentage">'
+        f'max confidence % <input type="number" name="max_conf" min="0" max="100" '
+        f'value="{max_conf}" style="width:4rem;"></label>'
         f'<label style="white-space:nowrap;"><input type="checkbox" name="verified" '
         f'value="1" {"checked" if verified_only else ""}> only albums with verified tracks</label>'
         f'<button type="submit" class="btn" style="{BTN_STYLE}">Filter</button></div>'
@@ -424,7 +536,7 @@ def home():
             f'<input type="checkbox" name="v" value="{v}" '
             f'{"checked" if v in sel_verdicts else ""}>'
             f'<span style="background:{color};color:#fff;border-radius:4px;'
-            f'padding:.05rem .4rem;">{v}</span></label>'
+            f'padding:.05rem .4rem;">{v} ({counts.get(v, 0)})</span></label>'
             for v, (color, vlabel) in VERDICT_STYLE.items())
         + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
           f'title="When matching the selected statuses, ignore manually verified tracks">'
@@ -459,7 +571,11 @@ def album():
         min_conf = max(0, min(100, int(request.args.get('min_conf', 0) or 0)))
     except ValueError:
         min_conf = 0
-    filtered = bool(sel_verdicts or min_conf or unverified_only)
+    try:
+        max_conf = max(0, min(100, int(request.args.get('max_conf', 0) or 0)))
+    except ValueError:
+        max_conf = 0
+    filtered = bool(sel_verdicts or min_conf or max_conf or unverified_only)
 
     where = ['album = %s']
     params = [name]
@@ -469,6 +585,9 @@ def album():
     if min_conf:
         where.append('confidence >= %s')
         params.append(min_conf / 100.0)
+    if max_conf:
+        where.append('confidence <= %s')
+        params.append(max_conf / 100.0)
     if unverified_only:
         where.append('NOT verified')
 
@@ -483,6 +602,22 @@ def album():
 
     cur.execute('SELECT COUNT(*) FROM ' + tbl + ' WHERE album = %s', (name,))
     total_tracks = cur.fetchone()[0]
+
+    # per-status counts for the album filter (respecting min/max confidence and verif)
+    count_where = ['album = %s']
+    count_params = [name]
+    if unverified_only:
+        count_where.append('NOT verified')
+    if min_conf:
+        count_where.append('confidence >= %s')
+        count_params.append(min_conf / 100.0)
+    if max_conf:
+        count_where.append('confidence <= %s')
+        count_params.append(max_conf / 100.0)
+    count_sql = ' WHERE ' + ' AND '.join(count_where)
+    cur.execute('SELECT verdict, COUNT(*) FROM ' + tbl + count_sql + ' GROUP BY verdict',
+                tuple(count_params))
+    album_counts = dict(cur.fetchall())
 
     cur.execute(
         'SELECT item_id, title, artist, suffix, bitrate, sample_rate, cutoff_hz,'
@@ -578,12 +713,16 @@ def album():
             f'<input type="checkbox" name="v" value="{v}" '
             f'{"checked" if v in sel_verdicts else ""}>'
             f'<span style="background:{color};color:#fff;border-radius:4px;'
-            f'padding:.05rem .4rem;">{v}</span></label>'
+            f'padding:.05rem .4rem;">{v} ({album_counts.get(v, 0)})</span></label>'
             for v, (color, vlabel) in VERDICT_STYLE.items())
         + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
           f'title="Show only tracks with verdict confidence at least this percentage">'
           f'min confidence % <input type="number" name="min_conf" min="0" max="100" '
           f'value="{min_conf}" style="width:4rem;"></label>'
+        + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
+          f'title="Show only tracks with verdict confidence at most this percentage">'
+          f'max confidence % <input type="number" name="max_conf" min="0" max="100" '
+          f'value="{max_conf}" style="width:4rem;"></label>'
         + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
           f'title="Hide manually verified tracks">'
           f'<input type="checkbox" name="unv" value="1" '
@@ -642,10 +781,13 @@ def scan():
     # (default queue) can be picked up by every default worker in parallel;
     # all_servers: a manual scan covers every configured media server, not
     # just the default one (no-op on a single-server / 2.x install).
-    # No task row is created here: the job keys its own row by its RQ job id
-    # (a route-invented uuid has no job behind it, so the core janitor would
-    # reap the row as orphaned mid-scan)
-    enqueue(jobs.scan_library_job, mode=mode, all_servers=True, queue='high')
+    # No task row is created here: the job keys its own row by the id the core
+    # queued it under (jobs._current_task_id), which is the only id the core's
+    # own bookkeeping — its Cancel button, its orphan sweeps — agrees with
+    try:
+        _enqueue(jobs.scan_library_job, mode=mode, all_servers=True, queue='high')
+    except _QueueRefused as exc:
+        return _queue_refused_page(exc, url_for('spectrum_analyzer.home'))
     return render_page(
         f'<p>Library scan started (mode: <strong>{_esc(mode)}</strong>), '
         'covering every configured media server. '
@@ -657,7 +799,10 @@ def scan():
 
 @bp.route('/rescan/<item_id>', methods=['POST'])
 def rescan(item_id):
-    enqueue(jobs.analyze_track_job, item_id, queue='high')
+    try:
+        _enqueue(jobs.analyze_track_job, item_id, queue='high')
+    except _QueueRefused as exc:
+        return _queue_refused_page(exc)
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
 
 
@@ -676,15 +821,20 @@ def deep_rescan(item_id):
     db.commit()
     cur.close()
     if tagged:
-        enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
+        try:
+            _enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
+        except _QueueRefused as exc:
+            _untag_deep_pending([item_id])
+            return _queue_refused_page(exc)
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
 
 
 @bp.route('/album/rescan_selected', methods=['POST'])
 def rescan_selected():
     item_ids = request.form.getlist('item_id')
-    for item_id in item_ids:
-        enqueue(jobs.analyze_track_job, item_id, queue='high')
+    _queued, _skipped, refusal = _enqueue_tracks(item_ids, queue='high')
+    if refusal:
+        return _queue_refused_page(refusal)
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
 
 
@@ -705,14 +855,16 @@ def deep_rescan_selected():
     tagged = [r[0] for r in cur.fetchall()]
     db.commit()
     cur.close()
-    for item_id in tagged:
-        enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
+    _queued, not_queued, refusal = _enqueue_tracks(tagged, deep=True, queue='high')
+    if refusal:
+        _untag_deep_pending(not_queued)
+        return _queue_refused_page(refusal)
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
 
 
 def _queue_deep_non_clean(album=None):
     """Tag-and-collect atomically; skip CLEAN, already-queued, and verified
-    tracks. Returns how many deep scans were queued. Default queue: bulk deep
+    tracks. Returns (queued count, refusal-or-None). Default queue: bulk deep
     scans are slow, let all workers share them instead of hogging high."""
     db = get_db()
     cur = db.cursor()
@@ -726,9 +878,10 @@ def _queue_deep_non_clean(album=None):
     item_ids = [r[0] for r in cur.fetchall()]
     db.commit()
     cur.close()
-    for item_id in item_ids:
-        enqueue(jobs.analyze_track_job, item_id, deep=True)
-    return len(item_ids)
+    queued, not_queued, refusal = _enqueue_tracks(item_ids, deep=True)
+    if refusal:
+        _untag_deep_pending(not_queued)
+    return len(queued), refusal
 
 
 def _requeue_all_deep_pending():
@@ -737,37 +890,50 @@ def _requeue_all_deep_pending():
     for when a user knows scans are stuck (e.g. after a worker crash) and
     doesn't want to wait for the TTL/cron. Re-queuing a scan that is still
     legitimately running or waiting in the queue causes a duplicate analysis,
-    so this is deliberately not automatic."""
+    so this is deliberately not automatic. Returns (requeued count, refusal)."""
     db = get_db()
     cur = db.cursor()
     cur.execute(
-        'UPDATE ' + table('results') + ' SET deep_pending_since = now()'
-        ' WHERE deep_pending = TRUE AND deep_eligible = TRUE'
-        ' RETURNING item_id')
+        'SELECT item_id FROM ' + table('results') +
+        ' WHERE deep_pending = TRUE AND deep_eligible = TRUE')
     item_ids = [r[0] for r in cur.fetchall()]
-    db.commit()
     cur.close()
-    for item_id in item_ids:
-        enqueue(jobs.analyze_track_job, item_id, deep=True)
-    return len(item_ids)
+    queued, _not_queued, refusal = _enqueue_tracks(item_ids, deep=True)
+    if queued:
+        # bumped only for the rows that actually made it onto the queue: the
+        # timestamp exists to stop the recovery cron re-detecting a row we just
+        # re-queued, so a row we could NOT queue has to keep its old one and
+        # stay visible to that cron
+        cur = db.cursor()
+        cur.execute('UPDATE ' + table('results') + ' SET deep_pending_since = now()'
+                    ' WHERE item_id = ANY(%s)', (queued,))
+        db.commit()
+        cur.close()
+    return len(queued), refusal
 
 
 @bp.route('/deep_pending/requeue_all', methods=['POST'])
 def requeue_deep_pending_all():
-    requeued = _requeue_all_deep_pending()
+    requeued, refusal = _requeue_all_deep_pending()
+    if refusal:
+        return _queue_refused_page(refusal, url_for('spectrum_analyzer.home'))
     return redirect(url_for('spectrum_analyzer.home', requeued=requeued))
 
 
 @bp.route('/album/deep_all', methods=['POST'])
 def deep_rescan_album():
     name = request.form.get('name') or ''
-    _queue_deep_non_clean(album=name)
+    _queued, refusal = _queue_deep_non_clean(album=name)
+    if refusal:
+        return _queue_refused_page(refusal)
     return redirect(request.referrer or url_for('spectrum_analyzer.album', name=name))
 
 
 @bp.route('/deep_all', methods=['POST'])
 def deep_rescan_all():
-    queued = _queue_deep_non_clean()
+    queued, refusal = _queue_deep_non_clean()
+    if refusal:
+        return _queue_refused_page(refusal, url_for('spectrum_analyzer.home'))
     return redirect(url_for('spectrum_analyzer.home', queued=queued))
 
 
@@ -787,9 +953,12 @@ def rescan_album():
     name = request.form.get('name') or ''
     album_id = (request.form.get('album_id') or '').strip()
     if album_id:
-        # no pre-created task row: the job keys its own row by its RQ job id,
-        # which is what the core janitor probes top-level rows against
-        enqueue(jobs.scan_album_job, album_id, name, mode='force')
+        # no pre-created task row: the job keys its own row by the id the core
+        # queued it under (jobs._current_task_id)
+        try:
+            _enqueue(jobs.scan_album_job, album_id, name, mode='force')
+        except _QueueRefused as exc:
+            return _queue_refused_page(exc)
     else:
         # no album id stored (e.g. hook-inserted rows): re-run track by track
         db = get_db()
@@ -798,8 +967,9 @@ def rescan_album():
                     (name,))
         item_ids = [r[0] for r in cur.fetchall()]
         cur.close()
-        for item_id in item_ids:
-            enqueue(jobs.analyze_track_job, item_id)
+        _queued, _skipped, refusal = _enqueue_tracks(item_ids)
+        if refusal:
+            return _queue_refused_page(refusal)
     return redirect(request.referrer
                     or url_for('spectrum_analyzer.album', name=name))
 

@@ -63,14 +63,20 @@ def _sniff_dsd(path):
     return None
 
 
-def _load_segment(path, segment_seconds):
+def _load_segment(path, segment_seconds, native_seekable=None, ffprobe_info=None):
     """Load a single mono segment at native sample rate via librosa. This is
     now only the last-resort fallback for distributed segment sampling
     (_load_windows) -- used when a track's duration can't be determined at
     all, is too short to distribute across several windows, or every
     windowed decode attempt failed (e.g. ffmpeg missing for a non-seekable
     container). Not "the middle of the track": offset 30s, falling back to
-    0s for short files."""
+    0s for short files.
+
+    `native_seekable` is _probe_container's verdict, threaded through from
+    _load_windows: False (libsndfile cannot open this container at all) is the
+    only case that earns the ffmpeg decode tier below. None means the caller
+    did not probe, and stays librosa-only.
+    """
     import librosa
 
     for offset in (30.0, 0.0):
@@ -83,7 +89,53 @@ def _load_segment(path, segment_seconds):
             return y, int(sr), offset
     if y is not None and sr and y.size > 0:
         return y, int(sr), 0.0
+    if native_seekable is False:
+        y, sr, offset = _ffmpeg_segment(path, segment_seconds, ffprobe_info)
+        if y is not None:
+            return y, sr, offset
     raise ValueError('could not decode audio (empty signal)')
+
+
+def _ffmpeg_sample_rate(path, ffprobe_info=None):
+    """The source sample rate an ffmpeg decode needs, reusing what
+    analyze_file already probed when it has it. None when ffprobe can't say."""
+    info = ffprobe_info
+    if not info or not info.get('sample_rate'):
+        info = _probe_ffprobe(path)
+    return info.get('sample_rate') if info else None
+
+
+def _ffmpeg_segment(path, segment_seconds, ffprobe_info=None):
+    """_load_segment's decode of last resort, through ffmpeg.
+
+    librosa 1.0 (AudioMuse-AI 3.3.1+) dropped the audioread backend, so
+    librosa.load now reads only what libsndfile can open and every
+    m4a/mp4/opus/wma/mpc file fails it outright. The windowed sampler has had
+    an ffmpeg tier for exactly those containers since 0.6.0; this gives the
+    single-window fallback the same one, so a format that used to analyze via
+    audioread does not silently become undecodable on a 3.3.1+ core.
+
+    Returns (None, None, None) when ffmpeg can't help either -- missing
+    binary, no readable audio stream -- leaving the caller to raise.
+    """
+    sr = _ffmpeg_sample_rate(path, ffprobe_info)
+    if not sr:
+        return None, None, None
+    duration = None
+    if ffprobe_info:
+        duration = ffprobe_info.get('duration')
+    for offset in (30.0, 0.0):
+        if offset and duration and offset + 5.0 > duration:
+            continue  # too short for the 30s offset to leave real audio
+        y = _read_window_ffmpeg(path, offset, segment_seconds, sr,
+                                timeout=_FFMPEG_SEGMENT_TIMEOUT)
+        if y is not None and y.size >= sr * 5:
+            return y, int(sr), offset
+    y = _read_window_ffmpeg(path, 0.0, segment_seconds, sr,
+                            timeout=_FFMPEG_SEGMENT_TIMEOUT)
+    if y is not None and y.size:
+        return y, int(sr), 0.0
+    return None, None, None
 
 
 # Distributed segment sampling: several shorter windows spread through the
@@ -140,6 +192,13 @@ def _read_window_soundfile(path, offset_s, duration_s):
     if y is None or y.size == 0:
         return None, None
     return np.ascontiguousarray(y.mean(axis=1), dtype=np.float32), int(sr)
+
+
+# ffmpeg decode budgets. A sampling window is seconds of audio; a deep-scan
+# chunk is _DEEP_CHUNK_SECONDS of it and a whole-file segment can be the decode
+# budget, so both get room to finish on slow storage before being given up on.
+_FFMPEG_SEGMENT_TIMEOUT = 120.0
+_FFMPEG_CHUNK_TIMEOUT = 120.0
 
 
 def _read_window_ffmpeg(path, offset_s, duration_s, sr, timeout=30.0):
@@ -202,7 +261,7 @@ def _load_windows(path, segment_seconds, native_seekable, ffprobe_info):
         duration = ffprobe_info.get('duration') if ffprobe_info else None
 
     if not duration or duration < _WINDOW_MIN_SECONDS * 2:
-        y, sr, off = _load_segment(path, segment_seconds)
+        y, sr, off = _load_segment(path, segment_seconds, native_seekable, ffprobe_info)
         return [(y, sr, off)]
 
     positions = _NATIVE_WINDOW_POSITIONS if native_seekable else _FFMPEG_WINDOW_POSITIONS
@@ -221,7 +280,7 @@ def _load_windows(path, segment_seconds, native_seekable, ffprobe_info):
 
     if windows:
         return windows
-    y, sr, off = _load_segment(path, segment_seconds)
+    y, sr, off = _load_segment(path, segment_seconds, native_seekable, ffprobe_info)
     return [(y, sr, off)]
 
 
@@ -238,11 +297,18 @@ def _spectrum(y, sr):
     return S_db, profile, freqs
 
 
-def _deep_spectrum(path, drop_db):
+def _deep_spectrum(path, drop_db, native_seekable=True, ffprobe_info=None):
     """Whole-file analysis in chunks (bounded memory): a global max-hold
     profile, a ~1 column/second display matrix for the spectrogram, and the
     per-second spectral-edge series used to tell a machine low-pass (constant
-    wall) from a genuine dark master (edge follows the music)."""
+    wall) from a genuine dark master (edge follows the music).
+
+    Decoding stays librosa's wherever librosa can still do it and switches to
+    ffmpeg for the whole file when it can't -- see read_chunk.
+    `native_seekable`/`ffprobe_info` are analyze_file's container probe, so the
+    switch costs no extra ffprobe call and never fires for a container
+    libsndfile CAN open (there a failure is corruption, not the wrong decoder).
+    """
     import librosa
 
     hop = N_FFT // 4
@@ -253,12 +319,49 @@ def _deep_spectrum(path, drop_db):
     total = 0.0
     t = 0.0
     chunk_error = False
+    ff_sr = [None]  # source sample rate once we have switched to ffmpeg
+
+    def read_chunk(offset):
+        """(y, sr) for one chunk, (None, None) at end of file, ValueError on a
+        decode error.
+
+        librosa first: it needs no subprocess and handles every container
+        libsndfile opens. On a 3.3.1+ core (librosa 1.0, audioread removed) an
+        m4a/mp4/opus/wma/mpc file fails on the very FIRST chunk instead, which
+        is the signal to redo the whole file through ffmpeg -- the same tier
+        _load_windows already uses for those containers.
+
+        Two failures deliberately do NOT switch decoders, because for both of
+        them librosa's failure is the finding: one after some audio decoded (a
+        genuine mid-file error), and any at all in a container libsndfile could
+        open, where a truncated or corrupt file would otherwise be quietly
+        rescued by ffmpeg decoding its intact prefix.
+        """
+        if ff_sr[0] is None:
+            try:
+                return librosa.load(path, sr=None, mono=True, offset=offset,
+                                    duration=_DEEP_CHUNK_SECONDS)
+            except Exception:
+                if offset > 0.0 or native_seekable:
+                    raise ValueError('decode failed mid-file')
+                ff_sr[0] = _ffmpeg_sample_rate(path, ffprobe_info)
+                if not ff_sr[0]:
+                    raise ValueError('no decoder for this container')
+        y = _read_window_ffmpeg(path, offset, _DEEP_CHUNK_SECONDS, ff_sr[0],
+                                timeout=_FFMPEG_CHUNK_TIMEOUT)
+        if y is None:
+            # ffmpeg returns nothing both past the end of the file and on a
+            # real error and cannot say which; only the first chunk is
+            # unambiguous, so a later empty read is read as end of file
+            if offset <= 0.0:
+                raise ValueError('ffmpeg could not decode this file')
+            return None, None
+        return y, ff_sr[0]
 
     while total < DEEP_MAX_SECONDS:
         try:
-            y, y_sr = librosa.load(path, sr=None, mono=True, offset=t,
-                                   duration=_DEEP_CHUNK_SECONDS)
-        except Exception:
+            y, y_sr = read_chunk(t)
+        except ValueError:
             chunk_error = True  # decode error, not a clean end-of-file signal
             break
         if y is None or not y_sr or y.size < y_sr:  # under 1 s left
@@ -1094,7 +1197,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
     try:
         if deep:
             (S_db, profile, freqs, sr, seg_len, edge_series,
-             capped, chunk_error) = _deep_spectrum(path, drop_db)
+             capped, chunk_error) = _deep_spectrum(path, drop_db, native_seekable,
+                                                   ffprobe_info)
             offset = 0.0
         else:
             if not native_seekable and ffprobe_info is None:

@@ -93,19 +93,35 @@ def _list_server_ids():
         return [None]
 
 
-def _rq_task_id():
-    """The running RQ job's id, to key our task_status row by.
+def _current_task_id():
+    """The queue's own id for the running job, to key our task_status row by.
 
-    The core janitor fails any top-level non-terminal task row older than a
-    grace period whose task_id has no RQ job behind it (Job.fetch by that id).
-    A row keyed by a self-invented uuid therefore gets reaped mid-scan; rows
-    MUST be keyed by the actual job id. Corollary: routes must not pre-create
-    the row either — run_plugin_task fetches the row keyed by the job id
-    before the task runs and, when it exists, overwrites it with a bare
-    SUCCESS (details wiped) afterwards. The job creates its own row instead.
+    A top-level job's row MUST carry the id the core queued the job under, and
+    the two queue generations disagree about what that id is:
+
+    3.2+ (Postgres queue) — `taskqueue.current_task_id()`. The row already
+      exists when the task starts (`enqueue()` writes it), so keying by this
+      updates that row in place instead of adding a second one beside it. It is
+      also the row the Cancel button replaces with a REVOKED tombstone, which is
+      what `revoked()` polls for, and a row the queue owns (`func` is set) is
+      never touched by the stale-in-process sweep.
+    2.x/3.0-3.1 (RQ) — the RQ job id, for the mirror-image reason: that
+      core's janitor failed any top-level non-terminal row whose id `Job.fetch`
+      could not find, so a self-invented uuid got reaped mid-scan.
+
+    Either way routes must not pre-create the row: run_plugin_task looks it up
+    by the job id before the task runs and, when it exists, overwrites it with a
+    bare SUCCESS (details wiped) afterwards. The job creates its own row.
     """
     try:
-        from rq import get_current_job
+        import taskqueue
+        task_id = taskqueue.current_task_id()   # 3.2+
+        if task_id:
+            return str(task_id)
+    except Exception:
+        pass
+    try:
+        from rq import get_current_job          # <= 3.1 (rq is gone in 3.2)
         job = get_current_job()
         return job.id if job is not None else None
     except Exception:
@@ -367,11 +383,44 @@ def _aggregate(child_rows, base=None):
     return total
 
 
+def _child_job_lost(handle):
+    """True when the queued job behind a child died without settling itself.
+
+    Only ever asked about a child whose OWN row is still non-terminal, so "the
+    job has ended" and "the job was lost" are the same statement here: a child
+    that finished normally wrote its terminal row before its job ended.
+
+    `enqueue()` hands back different things either side of the 3.2 queue
+    rewrite — the queue's task id (a str subclass) after it, an RQ Job before
+    it — so the check has to know both shapes.
+    """
+    if handle is None:
+        return False
+    if isinstance(handle, str):
+        return _queue_job_over(str(handle))     # 3.2+
+    return _rq_job_lost(handle)                 # <= 3.1
+
+
+def _queue_job_over(queue_task_id):
+    """True when a 3.2+ queue row has reached an end: terminal, or gone.
+
+    Retention only ever deletes terminal rows, so a row that has disappeared
+    ran to an end too. A queue row goes terminal strictly AFTER the child wrote
+    its own terminal row (the child returns, then run_plugin_task and the worker
+    finalize), so this can never overtake a child that did settle.
+    """
+    if not queue_task_id:
+        return False
+    try:
+        state = _task_state(queue_task_id)
+    except Exception:
+        return False  # transient DB error: decide on a later poll
+    return state is None or state in TERMINAL_STATES
+
+
 def _rq_job_lost(job):
     """True when the RQ job backing a child died without writing a terminal
-    task_status row (worker crash, job dropped from Redis)."""
-    if job is None:
-        return False
+    task_status row (worker crash, job dropped from Redis). Pre-3.2 cores."""
     try:
         from rq.exceptions import NoSuchJobError
     except ImportError:
@@ -385,6 +434,40 @@ def _rq_job_lost(job):
     except Exception:
         return False  # transient Redis error: decide on a later poll
     return state in ('failed', 'stopped', 'canceled')
+
+
+def _touch_live_children(parent_task_id):
+    """Refresh child rows going stale, so the core does not fail them for us.
+
+    A 3.2+ core fails any LIVE task_status row the queue does not own (`func IS
+    NULL`, which is every row written through save_task_status) once it has gone
+    QUEUE_INLINE_STALE_SECONDS — 30 minutes by default — without an
+    update. A running child rewrites its own row after every track, but a child
+    still QUEUED behind a full library of albums was written once at launch and
+    not since: past that deadline the sweep would fail it out from under us, the
+    parent would count it done, and the scan would report finished while the
+    album was still waiting for a worker. Touching only the rows actually
+    approaching the deadline keeps this a no-op UPDATE in the normal case.
+    """
+    stale = getattr(config, 'QUEUE_INLINE_STALE_SECONDS', None)
+    if not stale:
+        return  # pre-3.2 core: no sweep to dodge
+    try:
+        refresh_after = max(60.0, float(stale) / 2.0)
+    except (TypeError, ValueError):
+        return
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            'UPDATE task_status SET timestamp = NOW()'
+            ' WHERE parent_task_id = %s AND NOT (status = ANY(%s))'
+            ' AND timestamp < NOW() - make_interval(secs => %s)',
+            (parent_task_id, list(TERMINAL_STATES), refresh_after))
+        db.commit()
+        cur.close()
+    except Exception:
+        logger.exception('spectrum_analyzer: could not refresh child task rows')
 
 
 # ------------------------------------------------------------- album task --
@@ -463,7 +546,7 @@ def scan_album_job(album_id, album_name, mode='changed', task_id=None,
     """Analyze one album. Child of scan_library_job (which passes the server it
     planned the album against), or standalone for the per-album Re-analyze
     button (mode=force, no parent; server recovered from the stored rows)."""
-    task_id = task_id or _rq_task_id() or str(uuid.uuid4())
+    task_id = task_id or _current_task_id() or str(uuid.uuid4())
     settings = _settings()
     rev = dsp.analysis_rev(settings['drop_db'], settings['segment_seconds'])
     counters = {k: 0 for k in COUNTER_KEYS}
@@ -550,7 +633,7 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
     The cron entry point keeps the default False: a schedule's server scope
     already runs the task once per server, bound by the core.
     """
-    task_id = task_id or _rq_task_id() or str(uuid.uuid4())
+    task_id = task_id or _current_task_id() or str(uuid.uuid4())
     max_in_flight = max(1, int(getattr(config, 'MAX_QUEUED_ANALYSIS_JOBS', 25)))
 
     def status(state, progress, detail, extra=None):
@@ -576,7 +659,8 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
         albums_total = max(1, len(plan))
         albums_skipped = 0
         launched = 0
-        launched_jobs = {}  # child task_id -> rq Job, for lost-job reconciliation
+        launched_jobs = {}  # child task_id -> queue handle, for lost-job reconciliation
+        last_touch = [0.0]  # monotonic clock of the last _touch_live_children
         parent_counters = {k: 0 for k in COUNTER_KEYS}
         score_ids = _score_ids() if mode == 'changed' else None
         existing = _existing_rows() if mode == 'changed' else None
@@ -584,12 +668,19 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
         rev = dsp.analysis_rev(s['drop_db'], s['segment_seconds'])
 
         def snapshot(detail):
+            # cheap and almost always a no-op, but it has to run on a clock of
+            # its own: snapshot() is called per album while planning and every
+            # POLL_SECONDS while waiting, and neither cadence is a deadline
+            now = time.monotonic()
+            if now - last_touch[0] >= 60.0:
+                last_touch[0] = now
+                _touch_live_children(task_id)
             rows = _child_rows(task_id)
             done = 0
             for child_id, state, _details in rows:
                 if state in TERMINAL_STATES:
                     done += 1
-                elif _rq_job_lost(launched_jobs.get(child_id)):
+                elif _child_job_lost(launched_jobs.get(child_id)):
                     # worker died / job dropped: settle the row so the scan
                     # can finish instead of draining forever
                     logger.warning('spectrum_analyzer: child %s lost, marking FAILURE',
