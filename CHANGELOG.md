@@ -28,6 +28,18 @@ plugin builds on. Everything below still works on 2.6.2 and every 3.x.
   failed out from under the parent, counted done, and the scan reported finished
   while the album was still queued. `_touch_live_children` refreshes the rows
   that actually approach the deadline.
+- **Bulk actions work again.** The 3.2 queue guard counts live plugin tasks, not
+  just core ones, so the first track a route queued blocked the second: every bulk
+  button — Deep scan all non-CLEAN, Force re-queue, bulk selected, album
+  re-analyze without an album id — would have queued exactly one track. They now
+  start a single orchestrator task (`bulk_analyze_job`) that claims the tracks and
+  feeds them onto the default queue from inside a worker, capped at
+  `MAX_QUEUED_ANALYSIS_JOBS` in flight, reporting tracks done/remaining under
+  Active Tasks — the same shape the library scan uses for albums. Cancelling it
+  untags whatever it claimed but never launched. The overview's green
+  "Queued N deep scans" banner becomes "started — follow progress under Active
+  Tasks", because N is now decided when the job starts, not when you click.
+  The orphan-recovery cron feeds its backlog through the same throttle.
 - **Buttons explain a busy queue instead of returning 500.** From 3.2 the core
   refuses a plugin enqueue issued from the web process while another queue job
   is running. Scan, Re-analyze, Deep analyze, the bulk actions and Re-analyze

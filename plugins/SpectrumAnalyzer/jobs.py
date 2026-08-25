@@ -48,6 +48,7 @@ from . import dsp
 
 TASK_TYPE = 'plugin.spectrum_analyzer.scan'
 ALBUM_TASK_TYPE = 'plugin.spectrum_analyzer.scan_album'
+BULK_TASK_TYPE = 'plugin.spectrum_analyzer.bulk_analyze'
 
 COUNTER_KEYS = ('analyzed', 'skipped', 'unchanged', 'not_in_score', 'error')
 TERMINAL_STATES = (TASK_STATUS_SUCCESS, TASK_STATUS_FAILURE, TASK_STATUS_REVOKED)
@@ -800,6 +801,258 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
         raise
 
 
+def _queue_states(task_ids):
+    """{task_id: status} for the queue rows still present, None if unreadable.
+
+    A row that has vanished is simply absent from the mapping: the core's
+    retention sweep only ever deletes TERMINAL rows, and every root enqueue
+    runs it, so our own finished children are swept away as we launch the next
+    ones. "Missing" and "finished" therefore mean the same thing to callers.
+    """
+    if not task_ids:
+        return {}
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute('SELECT task_id, status FROM task_status WHERE task_id = ANY(%s)',
+                    (list(task_ids),))
+        rows = cur.fetchall()
+        cur.close()
+        return {r[0]: r[1] for r in rows}
+    except Exception:
+        logger.exception('spectrum_analyzer: could not read queue rows')
+        return None
+
+
+def _rq_job_finished(job):
+    """Pre-3.2: has this RQ job stopped occupying a worker, however it ended?"""
+    try:
+        state = str(job.get_status(refresh=True) or '')
+    except Exception:
+        # gone from Redis, or a Redis hiccup. Either way, freeing the throttle
+        # slot only risks running slightly wide; blocking on it risks a stall.
+        return True
+    return state in ('finished', 'failed', 'stopped', 'canceled')
+
+
+def _prune_finished(handles):
+    """Drop the finished jobs from {handle key: handle}; return how many remain.
+
+    `enqueue()` returns the queue's task id (a str subclass) on 3.2+ and an RQ
+    Job before that, so both shapes are pruned here -- the 3.2+ ones with a
+    single batched query rather than one per in-flight job.
+    """
+    if not handles:
+        return 0
+    queue_ids = [key for key, h in handles.items() if isinstance(h, str)]
+    states = _queue_states(queue_ids) if queue_ids else {}
+    if states is None:
+        return len(handles)  # transient DB error: re-decide on the next poll
+    for key, handle in list(handles.items()):
+        if isinstance(handle, str):
+            state = states.get(key)
+            over = state is None or state in TERMINAL_STATES
+        else:
+            over = _rq_job_finished(handle)
+        if over:
+            handles.pop(key, None)
+    return len(handles)
+
+
+def _clear_deep_pending_many(item_ids):
+    """Untag tracks a bulk deep scan claimed but never launched (cancelled).
+
+    Without this the tag -- which is what makes the deep-scan buttons
+    idempotent -- would block those tracks until the recovery TTL expires.
+    """
+    item_ids = [i for i in (item_ids or []) if i]
+    if not item_ids:
+        return
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute('UPDATE ' + table('results') +
+                    ' SET deep_pending=FALSE, deep_pending_since=NULL'
+                    ' WHERE item_id = ANY(%s)', (item_ids,))
+        db.commit()
+        cur.close()
+    except Exception:
+        logger.exception('spectrum_analyzer: could not untag unlaunched deep scans')
+
+
+def _claim_tracks(item_ids=None, album=None, select=None, deep=False):
+    """Decide, atomically, which tracks this bulk run owns.
+
+    For a deep run the claim IS the `deep_pending` tag, set by one
+    UPDATE ... RETURNING so two clicks cannot claim the same track twice. It
+    happens here, inside the job, rather than in the route: a route cannot know
+    whether the orchestrator it queues will ever run, and a tag written for a
+    job that never starts blocks the track until the recovery TTL.
+
+    select='non_clean'    every unverified, untagged, non-CLEAN track (within
+                          `album` when given) -- the "Deep scan all" buttons.
+    select='requeue_all'  every row ALREADY tagged, deliberately re-claimed:
+                          the manual escape hatch for scans a user knows are
+                          stuck. Only the timestamp moves, so the recovery cron
+                          stops re-detecting what we are about to launch.
+    select=None           the explicit `item_ids` from a selection, tagged the
+                          same way when deep (a plain re-analysis has no tag).
+    """
+    tbl = table('results')
+    ids = [str(i) for i in (item_ids or []) if i]
+    if select is None and not deep:
+        return ids  # plain re-analysis: nothing to claim
+    if select is None and not ids:
+        return []
+    db = get_db()
+    cur = db.cursor()
+    try:
+        if select == 'requeue_all':
+            cur.execute('UPDATE ' + tbl + ' SET deep_pending_since = now()'
+                        ' WHERE deep_pending = TRUE AND deep_eligible = TRUE'
+                        ' RETURNING item_id')
+        else:
+            sql = ('UPDATE ' + tbl +
+                   ' SET deep_pending=TRUE, deep_pending_since=now()'
+                   ' WHERE NOT deep_pending AND deep_eligible')
+            params = []
+            if select == 'non_clean':
+                sql += " AND verdict IS DISTINCT FROM 'CLEAN' AND NOT verified"
+                if album is not None:
+                    sql += ' AND album = %s'
+                    params.append(album)
+            else:
+                sql += ' AND item_id = ANY(%s)'
+                params.append(ids)
+            cur.execute(sql + ' RETURNING item_id', tuple(params))
+        claimed = [r[0] for r in cur.fetchall()]
+        db.commit()
+        return claimed
+    finally:
+        cur.close()
+
+
+def _launch_throttled(targets, deep, on_progress=None, should_stop=None):
+    """Queue one analyze_track_job per target, then wait for them to drain.
+
+    Keeps at most MAX_QUEUED_ANALYSIS_JOBS of them unfinished, the same
+    throttle scan_library_job applies to its album children, so a thousand
+    deep scans do not land on the queue at once. Draining before returning
+    costs nothing: every child is itself a live `plugin.%` root, so the queue
+    guard stays busy either way, and staying alive is what makes the parent's
+    progress mean anything.
+
+    Returns (launched, unlaunched). `should_stop()` is polled before each
+    launch and throughout the waits, so a cancelled parent stops promptly and
+    gets back what it never launched (to untag it). `on_progress(launched,
+    in_flight, waiting)` is called on every change of state.
+    """
+    max_in_flight = max(1, int(getattr(config, 'MAX_QUEUED_ANALYSIS_JOBS', 25)))
+    targets = list(targets)
+    handles = {}
+    launched = []
+
+    for i, item_id in enumerate(targets):
+        while True:
+            in_flight = _prune_finished(handles)
+            if should_stop and should_stop():
+                return launched, targets[i:]
+            if in_flight < max_in_flight:
+                break
+            if on_progress:
+                on_progress(len(launched), in_flight, True)
+            time.sleep(POLL_SECONDS)
+        handle = enqueue(analyze_track_job, item_id, deep=deep)
+        handles[str(getattr(handle, 'id', None) or handle)] = handle
+        launched.append(item_id)
+        if on_progress:
+            on_progress(len(launched), len(handles), False)
+
+    while True:
+        in_flight = _prune_finished(handles)
+        if in_flight <= 0:
+            return launched, []
+        if should_stop and should_stop():
+            return launched, []
+        if on_progress:
+            on_progress(len(launched), in_flight, True)
+        time.sleep(POLL_SECONDS)
+
+
+def bulk_analyze_job(item_ids=None, album=None, select=None, deep=False,
+                     task_id=None):
+    """Parent orchestrator for every bulk track action, on the *high* queue.
+
+    Exists because of the 3.2 queue guard: `plugin.api.enqueue()` refuses an
+    enqueue issued from the web process while any live `plugin.%` root exists,
+    and the first track a route queues IS such a root -- so a route loop can
+    only ever queue one track. A task already running on a worker is exempt, so
+    the fan-out has to happen from in here.
+
+    Same shape as scan_library_job one level down: claim the work, launch one
+    analyze_track_job per track onto the *default* queue so every worker shares
+    the load, keep at most MAX_QUEUED_ANALYSIS_JOBS in flight, and report
+    done/remaining. Cancelling the parent stops further launches and untags
+    whatever it had claimed but not yet launched.
+    """
+    task_id = task_id or _current_task_id() or str(uuid.uuid4())
+    label = 'deep scan' if deep else 're-analysis'
+
+    def status(state, progress, detail, extra=None):
+        try:
+            save_task_status(task_id, BULK_TASK_TYPE, state, progress=progress,
+                             details={'deep': bool(deep), 'info': detail,
+                                      **(extra or {})})
+        except Exception:
+            logger.exception('spectrum_analyzer: save_task_status failed')
+
+    def revoked():
+        return _task_state(task_id) == TASK_STATUS_REVOKED
+
+    status(TASK_STATUS_STARTED, 0, f'selecting tracks for {label}')
+    try:
+        targets = _claim_tracks(item_ids, album, select, deep)
+        total = len(targets)
+
+        def extra(count, in_flight):
+            done = count - in_flight
+            return {'tracks_total': total, 'tracks_launched': count,
+                    'tracks_done': done, 'tracks_remaining': total - done}
+
+        def progress(count, in_flight):
+            done = count - in_flight
+            return int(done * 100 / total) if total else 100
+
+        if not total:
+            status(TASK_STATUS_SUCCESS, 100, 'nothing to do', extra(0, 0))
+            logger.info('spectrum_analyzer bulk %s: nothing to do', label)
+            return extra(0, 0)
+
+        def report(count, in_flight, waiting):
+            detail = (f'waiting for workers ({in_flight} tracks in flight)'
+                      if waiting else f'queued {count}/{total}')
+            status(TASK_STATUS_PROGRESS, progress(count, in_flight),
+                   detail, extra(count, in_flight))
+
+        launched, unlaunched = _launch_throttled(
+            targets, deep, on_progress=report, should_stop=revoked)
+
+        if unlaunched or revoked():
+            logger.info('spectrum_analyzer bulk %s %s cancelled (%d of %d launched)',
+                        label, task_id, len(launched), total)
+            if deep:
+                _clear_deep_pending_many(unlaunched)
+            return
+
+        done = extra(len(launched), 0)
+        status(TASK_STATUS_SUCCESS, 100, 'done', done)
+        logger.info('spectrum_analyzer bulk %s finished: %s', label, done)
+        return done
+    except Exception as exc:
+        status(TASK_STATUS_FAILURE, 0, str(exc))
+        raise
+
+
 def _clear_deep_pending(item_id):
     try:
         db = get_db()
@@ -905,11 +1158,16 @@ def recover_deep_pending_task():
     item_ids = [r[0] for r in cur.fetchall()]
     db.commit()
     cur.close()
-    for item_id in item_ids:
-        logger.warning(
-            'spectrum_analyzer: deep scan orphaned for %s, re-queuing', item_id)
-        enqueue(analyze_track_job, item_id, deep=True)
-    return {'requeued': len(item_ids)}
+    if not item_ids:
+        return {'requeued': 0}
+    logger.warning(
+        'spectrum_analyzer: %d deep scan(s) orphaned past the %sh TTL, re-queuing',
+        len(item_ids), ttl_hours)
+    # through the shared throttle: recovering a big backlog must not put every
+    # orphan on the queue at once. No claim step here -- the TTL UPDATE above
+    # IS this task's claim, and it re-claims rows that are already tagged.
+    launched, _unlaunched = _launch_throttled(item_ids, deep=True)
+    return {'requeued': len(launched)}
 
 
 def on_song_analyzed(song):

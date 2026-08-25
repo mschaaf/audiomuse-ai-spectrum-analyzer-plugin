@@ -213,21 +213,20 @@ def _enqueue(*args, **kwargs):
         raise _QueueRefused(getattr(exc, 'user_message', None) or str(exc)) from exc
 
 
-def _enqueue_tracks(item_ids, deep=False, queue='default'):
-    """Queue one analyze_track_job per id, stopping at the first refusal.
+def _enqueue_bulk(item_ids=None, album=None, select=None, deep=False):
+    """Hand a bulk track action to one orchestrator task and return.
 
-    Returns (queued, not_queued, refusal). A refusal describes the queue, not
-    the track, so once one id is refused every later one would be too: stop,
-    and hand the rest back so the caller can undo whatever it staged for them.
+    A route CANNOT loop over `enqueue()`: from 3.2 the core consults the queue
+    guard on every enqueue made from the web process, and the guard counts live
+    `plugin.%` roots — so the first track queued blocks the second. The
+    orchestrator runs on the high queue and fans the tracks out from inside a
+    worker, where the guard does not apply (`jobs.bulk_analyze_job`). It also
+    does the claiming: a route cannot know whether the job it queues will ever
+    run, and a `deep_pending` tag written for a job that never starts would
+    block those tracks until the recovery TTL.
     """
-    queued, pending = [], list(item_ids)
-    while pending:
-        try:
-            _enqueue(jobs.analyze_track_job, pending[0], deep=deep, queue=queue)
-        except _QueueRefused as exc:
-            return queued, pending, exc
-        queued.append(pending.pop(0))
-    return queued, [], None
+    _enqueue(jobs.bulk_analyze_job, item_ids=item_ids, album=album,
+             select=select, deep=deep, queue='high')
 
 
 def _untag_deep_pending(item_ids):
@@ -424,27 +423,18 @@ def home():
         'actually stuck (e.g. after a worker crash) &mdash; otherwise you will get '
         'duplicate scans.</p>')
 
-    queued_msg = ''
-    try:
-        queued = int(request.args.get('queued', ''))
-    except ValueError:
-        queued = None
-    if queued is not None:
-        queued_msg = (f'<p style="color:#16a34a;font-weight:600;">Queued {queued} '
-                      f'deep scan{"s" if queued != 1 else ""}'
-                      + (' (all non-CLEAN tracks are already queued or verified)'
-                         if queued == 0 else '') + '.</p>')
-
-    requeued_msg = ''
-    try:
-        requeued = int(request.args.get('requeued', ''))
-    except ValueError:
-        requeued = None
-    if requeued is not None:
-        requeued_msg = (f'<p style="color:#16a34a;font-weight:600;">Force re-queued '
-                        f'{requeued} deep scan{"s" if requeued != 1 else ""}'
-                        + (' (no tracks were currently marked deep scan queued)'
-                           if requeued == 0 else '') + '.</p>')
+    # The bulk buttons hand off to an orchestrator task rather than queueing
+    # the tracks themselves (see _enqueue_bulk), so the count is not known here
+    # any more: it is decided by the claim the job makes when it starts, and
+    # reported on the job's own row under Active Tasks.
+    started = request.args.get('started')
+    started_msg = ''
+    if started in ('deep', 'requeue'):
+        what = ('Force re-queue of every track marked deep scan queued'
+                if started == 'requeue' else 'Deep scan of all non-CLEAN tracks')
+        started_msg = (f'<p style="color:#16a34a;font-weight:600;">{what} started '
+                       '&mdash; tracks are queued in batches, follow progress under '
+                       'Active Tasks.</p>')
 
     def _album_tags(ver, pending):
         tags = ''
@@ -501,7 +491,7 @@ def home():
         f'(could not be analyzed: decode failure or unsupported format), '
         f'<strong style="color:#6b7280;">{n_verified}</strong> manually verified '
         f'(excluded from suspect and lowpassed counts).</p>'
-        f'{queued_msg}{requeued_msg}'
+        f'{started_msg}'
         f'<div style="margin:.8rem 0;">{scan_buttons}</div>'
         '<p style="font-size:.85rem;color:#6b7280;">Scans run on the worker, album by album; '
         'progress appears under Active Tasks. Already-analyzed tracks are skipped unless '
@@ -832,9 +822,12 @@ def deep_rescan(item_id):
 @bp.route('/album/rescan_selected', methods=['POST'])
 def rescan_selected():
     item_ids = request.form.getlist('item_id')
-    _queued, _skipped, refusal = _enqueue_tracks(item_ids, queue='high')
-    if refusal:
-        return _queue_refused_page(refusal)
+    if not item_ids:
+        return redirect(request.referrer or url_for('spectrum_analyzer.home'))
+    try:
+        _enqueue_bulk(item_ids=item_ids)
+    except _QueueRefused as exc:
+        return _queue_refused_page(exc)
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
 
 
@@ -843,98 +836,45 @@ def deep_rescan_selected():
     item_ids = request.form.getlist('item_id')
     if not item_ids:
         return redirect(request.referrer or url_for('spectrum_analyzer.home'))
-    # same NOT deep_pending AND deep_eligible guard as the single-track button;
-    # tag-and-collect keeps it idempotent for tracks already queued/running
-    db = get_db()
-    cur = db.cursor()
-    cur.execute(
-        'UPDATE ' + table('results') + ' SET deep_pending=TRUE, deep_pending_since=now()'
-        ' WHERE item_id = ANY(%s) AND NOT deep_pending AND deep_eligible'
-        ' RETURNING item_id',
-        (item_ids,))
-    tagged = [r[0] for r in cur.fetchall()]
-    db.commit()
-    cur.close()
-    _queued, not_queued, refusal = _enqueue_tracks(tagged, deep=True, queue='high')
-    if refusal:
-        _untag_deep_pending(not_queued)
-        return _queue_refused_page(refusal)
+    # the tag-and-collect (same NOT deep_pending AND deep_eligible guard as the
+    # single-track button) happens inside the orchestrator, so a job that never
+    # starts cannot leave tags behind
+    try:
+        _enqueue_bulk(item_ids=item_ids, deep=True)
+    except _QueueRefused as exc:
+        return _queue_refused_page(exc)
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
-
-
-def _queue_deep_non_clean(album=None):
-    """Tag-and-collect atomically; skip CLEAN, already-queued, and verified
-    tracks. Returns (queued count, refusal-or-None). Default queue: bulk deep
-    scans are slow, let all workers share them instead of hogging high."""
-    db = get_db()
-    cur = db.cursor()
-    sql = ('UPDATE ' + table('results') + ' SET deep_pending=TRUE, deep_pending_since=now()'
-           " WHERE verdict IS DISTINCT FROM 'CLEAN'"
-           ' AND NOT verified AND NOT deep_pending AND deep_eligible')
-    if album is None:
-        cur.execute(sql + ' RETURNING item_id')
-    else:
-        cur.execute(sql + ' AND album = %s RETURNING item_id', (album,))
-    item_ids = [r[0] for r in cur.fetchall()]
-    db.commit()
-    cur.close()
-    queued, not_queued, refusal = _enqueue_tracks(item_ids, deep=True)
-    if refusal:
-        _untag_deep_pending(not_queued)
-    return len(queued), refusal
-
-
-def _requeue_all_deep_pending():
-    """Force re-queue every row currently flagged deep_pending, ignoring the
-    orphan-recovery TTL (see recover_deep_pending_task). Manual escape hatch
-    for when a user knows scans are stuck (e.g. after a worker crash) and
-    doesn't want to wait for the TTL/cron. Re-queuing a scan that is still
-    legitimately running or waiting in the queue causes a duplicate analysis,
-    so this is deliberately not automatic. Returns (requeued count, refusal)."""
-    db = get_db()
-    cur = db.cursor()
-    cur.execute(
-        'SELECT item_id FROM ' + table('results') +
-        ' WHERE deep_pending = TRUE AND deep_eligible = TRUE')
-    item_ids = [r[0] for r in cur.fetchall()]
-    cur.close()
-    queued, _not_queued, refusal = _enqueue_tracks(item_ids, deep=True)
-    if queued:
-        # bumped only for the rows that actually made it onto the queue: the
-        # timestamp exists to stop the recovery cron re-detecting a row we just
-        # re-queued, so a row we could NOT queue has to keep its old one and
-        # stay visible to that cron
-        cur = db.cursor()
-        cur.execute('UPDATE ' + table('results') + ' SET deep_pending_since = now()'
-                    ' WHERE item_id = ANY(%s)', (queued,))
-        db.commit()
-        cur.close()
-    return len(queued), refusal
 
 
 @bp.route('/deep_pending/requeue_all', methods=['POST'])
 def requeue_deep_pending_all():
-    requeued, refusal = _requeue_all_deep_pending()
-    if refusal:
-        return _queue_refused_page(refusal, url_for('spectrum_analyzer.home'))
-    return redirect(url_for('spectrum_analyzer.home', requeued=requeued))
+    # select='requeue_all': deliberately re-claims rows that ARE tagged, the
+    # escape hatch for scans the user knows are stuck. Not automatic, because
+    # re-queuing one that is merely slow means analyzing it twice.
+    try:
+        _enqueue_bulk(select='requeue_all', deep=True)
+    except _QueueRefused as exc:
+        return _queue_refused_page(exc, url_for('spectrum_analyzer.home'))
+    return redirect(url_for('spectrum_analyzer.home', started='requeue'))
 
 
 @bp.route('/album/deep_all', methods=['POST'])
 def deep_rescan_album():
     name = request.form.get('name') or ''
-    _queued, refusal = _queue_deep_non_clean(album=name)
-    if refusal:
-        return _queue_refused_page(refusal)
+    try:
+        _enqueue_bulk(select='non_clean', album=name, deep=True)
+    except _QueueRefused as exc:
+        return _queue_refused_page(exc)
     return redirect(request.referrer or url_for('spectrum_analyzer.album', name=name))
 
 
 @bp.route('/deep_all', methods=['POST'])
 def deep_rescan_all():
-    queued, refusal = _queue_deep_non_clean()
-    if refusal:
-        return _queue_refused_page(refusal, url_for('spectrum_analyzer.home'))
-    return redirect(url_for('spectrum_analyzer.home', queued=queued))
+    try:
+        _enqueue_bulk(select='non_clean', deep=True)
+    except _QueueRefused as exc:
+        return _queue_refused_page(exc, url_for('spectrum_analyzer.home'))
+    return redirect(url_for('spectrum_analyzer.home', started='deep'))
 
 
 @bp.route('/verify/<item_id>', methods=['POST'])
@@ -967,9 +907,11 @@ def rescan_album():
                     (name,))
         item_ids = [r[0] for r in cur.fetchall()]
         cur.close()
-        _queued, _skipped, refusal = _enqueue_tracks(item_ids)
-        if refusal:
-            return _queue_refused_page(refusal)
+        if item_ids:
+            try:
+                _enqueue_bulk(item_ids=item_ids)
+            except _QueueRefused as exc:
+                return _queue_refused_page(exc)
     return redirect(request.referrer
                     or url_for('spectrum_analyzer.album', name=name))
 
