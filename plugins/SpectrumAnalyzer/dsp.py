@@ -29,7 +29,7 @@ N_FFT = 4096
 
 # Bump when verdict logic changes so stored results re-analyze on the next
 # non-force scan (the skip paths in jobs.py require a rev match).
-ANALYSIS_REV = 6
+ANALYSIS_REV = 7
 
 
 def analysis_rev(drop_db, segment_seconds):

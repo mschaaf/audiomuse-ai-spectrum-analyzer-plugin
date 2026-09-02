@@ -90,11 +90,36 @@ def migrate(db):
     # "deep scan any non-CLEAN track" behavior)
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS deep_eligible BOOLEAN NOT NULL DEFAULT TRUE')
-    # Prerelease: timestamp when deep_pending was set, used for orphan detection
+    # Prerelease: timestamp when deep_pending was set; the reconciler's
+    # warning-grace reference for claims it cannot settle from the queue
     cur.execute('ALTER TABLE ' + tbl +
                 ' ADD COLUMN IF NOT EXISTS deep_pending_since TIMESTAMP')
+    # 0.4.0: queue-aware deep claim model. Each deep scan owns a claim id;
+    # the state tracks claimed -> launched -> running -> (cleared | failed |
+    # outcome_unknown), and the backend records which queue generation the
+    # child went into so the reconciler reads its status from the right place.
+    # Existing pending rows are NOT backfilled: a deep_pending with a NULL
+    # deep_claim_id is legacy-ambiguous and stays manual-retry-only.
+    for col in ('deep_claim_id TEXT', 'deep_task_id TEXT',
+                'deep_queue_backend TEXT', 'deep_claim_state TEXT',
+                'deep_claimed_at TIMESTAMP', 'deep_completed_claim_id TEXT',
+                'deep_completed_at TIMESTAMP', 'deep_claim_detail TEXT'):
+        cur.execute('ALTER TABLE ' + tbl + ' ADD COLUMN IF NOT EXISTS ' + col)
+    for name, check in (
+            (tbl + '_deep_claim_state_chk',
+             'deep_claim_state IS NULL OR deep_claim_state IN'
+             " ('claimed', 'launched', 'running', 'failed', 'outcome_unknown')"),
+            (tbl + '_deep_queue_backend_chk',
+             'deep_queue_backend IS NULL OR deep_queue_backend IN'
+             " ('postgres', 'rq')")):
+        cur.execute('SELECT 1 FROM pg_constraint WHERE conname = %s', (name,))
+        if cur.fetchone() is None:
+            cur.execute('ALTER TABLE ' + tbl + ' ADD CONSTRAINT ' + name +
+                        ' CHECK (' + check + ')')
     _migrate_v3_ids(db, cur, tbl)
     cur.execute('CREATE INDEX IF NOT EXISTS ' + tbl + '_album_idx ON ' + tbl + ' (album)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ' + tbl + '_deep_claim_idx ON ' +
+                tbl + ' (deep_claim_id) WHERE deep_pending')
     # optional weekly incremental scan, shipped disabled (admin enables it)
     cur.execute(
         'INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s, %s, %s, FALSE) '
@@ -102,7 +127,10 @@ def migrate(db):
         ('plugin.spectrum_analyzer.scan_changed',
          'plugin.spectrum_analyzer.scan_changed', '0 4 * * 0'),
     )
-    # optional deep-scan orphan recovery, shipped disabled (admin enables it)
+    # optional deep-claim reconciliation, shipped disabled (admin enables it).
+    # The task name predates the claim model and is kept so installs that
+    # enabled the old orphan-recovery cron keep working: it now reconciles
+    # claim state against the queue and never re-queues anything.
     cur.execute(
         'INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s, %s, %s, FALSE) '
         'ON CONFLICT (task_type) DO NOTHING',
@@ -205,9 +233,12 @@ def _enqueue(*args, **kwargs):
     500 on a button click, so every route queues through here. A job already
     running on a worker is exempt (it holds the guard), which is why the
     parent scan can still fan its album children out from inside itself.
+
+    Returns the core's enqueue handle (the queue task id on 3.2+, an RQ Job
+    before) so a route that claimed a deep scan can attach it to the claim.
     """
     try:
-        enqueue(*args, **kwargs)
+        return enqueue(*args, **kwargs)
     except Exception as exc:
         logger.warning('spectrum_analyzer: the core refused to queue our task: %s', exc)
         raise _QueueRefused(getattr(exc, 'user_message', None) or str(exc)) from exc
@@ -229,28 +260,6 @@ def _enqueue_bulk(item_ids=None, album=None, select=None, deep=False):
              select=select, deep=deep, queue='high')
 
 
-def _untag_deep_pending(item_ids):
-    """Drop the "deep scan queued" tag from rows whose scan never got queued.
-
-    The routes tag first so the page updates immediately, and the tag is what
-    makes the button idempotent — so a tag left behind by a refused enqueue
-    would block the track until the orphan-recovery TTL expires.
-    """
-    item_ids = [i for i in item_ids if i]
-    if not item_ids:
-        return
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute('UPDATE ' + table('results') +
-                    ' SET deep_pending=FALSE, deep_pending_since=NULL'
-                    ' WHERE item_id = ANY(%s)', (item_ids,))
-        db.commit()
-        cur.close()
-    except Exception:
-        logger.exception('spectrum_analyzer: could not clear deep_pending after a refusal')
-
-
 def _queue_refused_page(refusal, back_url=None):
     """A 409 page explaining that nothing was queued, instead of a 500."""
     back = back_url or request.referrer or url_for('spectrum_analyzer.home')
@@ -270,6 +279,43 @@ def _badge(verdict, confidence=None):
     return (f'<span title="{_esc(label)}" style="background:{color};color:#fff;'
             f'border-radius:4px;padding:.1rem .45rem;font-size:.8rem;'
             f'white-space:nowrap;">{_esc(verdict)}{conf}</span>')
+
+
+def _deep_badge(deep_pending, deep_claim_state):
+    """The track-card deep-scan badge, state-aware.
+
+    deep_pending stays true for every active, failed, unknown and legacy
+    claim, so the badge — and the disabled Deep-analyze button — key on it;
+    the claim state decides what the badge says.
+    """
+    if not deep_pending:
+        return ''
+    states = {
+        None: ('#6b7280', 'deep scan queued (legacy)',
+               'A deep scan was queued before the claim model existed and its '
+               'outcome is unknown. Use the retry controls on the overview '
+               'page to re-queue it.'),
+        'claimed': ('#f59e0b', 'deep scan queued',
+                    'A deep scan is waiting in the queue for this track'),
+        'launched': ('#f59e0b', 'deep scan queued',
+                     'A deep scan is waiting in the queue for this track'),
+        'running': ('#3b82f6', 'deep scan running',
+                    'A deep scan of this track is in progress'),
+        'failed': ('#dc2626', 'deep scan failed',
+                   'The deep scan failed. Use the retry controls on the '
+                   'overview page to re-queue it.'),
+        'outcome_unknown': ('#9333ea', 'deep scan outcome unknown',
+                            'The deep scan\'s queue outcome could not be '
+                            'established. Re-queueing may run the scan twice; '
+                            'use the overview page controls.'),
+    }
+    color, label, tip = states.get(
+        deep_claim_state,
+        ('#f59e0b', 'deep scan queued',
+         'A deep scan is queued or running for this track'))
+    return (f'<span style="background:{color};color:#fff;border-radius:4px;'
+            f'padding:.1rem .45rem;font-size:.8rem;margin-left:.4rem;'
+            f'white-space:nowrap;" title="{_esc(tip)}">{label}</span>')
 
 
 def _khz(hz):
@@ -297,10 +343,14 @@ def home():
         min_conf = max(0, min(100, int(request.args.get('min_conf', 0) or 0)))
     except ValueError:
         min_conf = 0
+    # omitted/empty max_conf is NO upper bound (None); an explicit 0 is a real
+    # bound (zero-confidence INCONCLUSIVE results are valid filter targets)
+    raw_max = request.args.get('max_conf')
     try:
-        max_conf = max(0, min(100, int(request.args.get('max_conf', 0) or 0)))
+        max_conf = (max(0, min(100, int(raw_max)))
+                    if raw_max not in (None, '') else None)
     except ValueError:
-        max_conf = 0
+        max_conf = None
     per_page = 100
 
     # manually verified tracks never count as suspect or lowpassed
@@ -317,6 +367,17 @@ def home():
         ' COUNT(DISTINCT album) FROM ' + tbl, (SUSPECT_VERDICTS,))
     total, suspects, n_lowpassed, n_inconclusive, n_verified, n_albums = cur.fetchone()
 
+    # deep-claim breakdown for the retry controls: legacy (no claim metadata),
+    # failed, outcome_unknown, and live (claimed/launched/running)
+    cur.execute(
+        'SELECT COUNT(*) FILTER (WHERE deep_pending AND deep_claim_id IS NULL),'
+        " COUNT(*) FILTER (WHERE deep_pending AND deep_claim_state = 'failed'),"
+        " COUNT(*) FILTER (WHERE deep_pending"
+        " AND deep_claim_state = 'outcome_unknown'),"
+        " COUNT(*) FILTER (WHERE deep_pending AND deep_claim_state IN"
+        " ('claimed', 'launched', 'running')) FROM " + tbl)
+    deep_legacy, deep_failed, deep_unknown, deep_live = cur.fetchone()
+
     # per-status counts for the filter UI (respecting search and confidence/unverified filters)
     count_where = []
     count_params = []
@@ -328,7 +389,7 @@ def home():
     if min_conf:
         count_where.append('confidence >= %s')
         count_params.append(min_conf / 100.0)
-    if max_conf:
+    if max_conf is not None:
         count_where.append('confidence <= %s')
         count_params.append(max_conf / 100.0)
     count_sql = (' WHERE ' + ' AND '.join(count_where)) if count_where else ''
@@ -351,18 +412,23 @@ def home():
     if min_bad:
         having.append(bad_expr + ' >= %s')
         having_params += [SUSPECT_VERDICTS, min_bad]
+    # one combined predicate so a single track must satisfy BOTH bounds
+    # (separate FILTERs would let one 90% track and one 0% track pass
+    # min_conf=80&max_conf=20 although no single track matches both)
+    conf_bounds = []
+    conf_params = []
     if min_conf:
-        # albums containing at least one song whose verdict confidence
-        # clears the threshold (confidence is stored 0.0-1.0; the UI is %)
-        cond = 'confidence >= %s' + (' AND NOT verified' if unverified_only else '')
-        having.append('COUNT(*) FILTER (WHERE ' + cond + ') > 0')
-        having_params.append(min_conf / 100.0)
-    if max_conf:
-        # albums containing at least one song whose verdict confidence
-        # is at most this percentage
-        cond = 'confidence <= %s' + (' AND NOT verified' if unverified_only else '')
-        having.append('COUNT(*) FILTER (WHERE ' + cond + ') > 0')
-        having_params.append(max_conf / 100.0)
+        conf_bounds.append('confidence >= %s')
+        conf_params.append(min_conf / 100.0)
+    if max_conf is not None:
+        conf_bounds.append('confidence <= %s')
+        conf_params.append(max_conf / 100.0)
+    if conf_bounds:
+        condition = ' AND '.join(conf_bounds)
+        if unverified_only:
+            condition += ' AND NOT verified'
+        having.append('COUNT(*) FILTER (WHERE ' + condition + ') > 0')
+        having_params += conf_params
     if verified_only:
         having.append('COUNT(*) FILTER (WHERE verified) > 0')
     having_sql = (' HAVING ' + ' AND '.join(having)) if having else ''
@@ -373,6 +439,9 @@ def home():
         'SELECT album, COUNT(*), ' + bad_expr + ', ' + low_expr + ','
         ' COUNT(*) FILTER (WHERE verified),'
         ' COUNT(*) FILTER (WHERE deep_pending),'
+        " COUNT(*) FILTER (WHERE deep_pending AND deep_claim_state = 'failed'),"
+        " COUNT(*) FILTER (WHERE deep_pending"
+        " AND deep_claim_state = 'outcome_unknown'),"
         ' MIN(cutoff_hz), to_char(MAX(analyzed_at), \'DD-MM-YYYY HH24:MI\')'
         ' FROM ' + tbl + ' GROUP BY album'
         + having_sql +
@@ -404,24 +473,47 @@ def home():
         f'every track in the library whose verdict is not CLEAN. Verified and '
         f'already-queued tracks are skipped.">Deep scan all non-CLEAN</button></form>')
 
+    # The reconciler cron never re-queues: an uncertain queue outcome is a
+    # badge, and retrying is a deliberate user action. Live scans (claimed /
+    # launched / running) have no retry control at all.
     requeue_pending_block = (
+        '<p style="font-size:.9rem;margin:.2rem 0;">Deep scans: '
+        f'<span style="background:#f59e0b;color:#fff;border-radius:4px;'
+        f'padding:.05rem .4rem;">queued/running &times;{deep_live}</span> '
+        f'<span style="background:#dc2626;color:#fff;border-radius:4px;'
+        f'padding:.05rem .4rem;">failed &times;{deep_failed}</span> '
+        f'<span style="background:#9333ea;color:#fff;border-radius:4px;'
+        f'padding:.05rem .4rem;">outcome unknown &times;{deep_unknown}</span> '
+        f'<span style="background:#6b7280;color:#fff;border-radius:4px;'
+        f'padding:.05rem .4rem;">legacy &times;{deep_legacy}</span></p>'
+        + (
         f'<form method="post" action="{url_for("spectrum_analyzer.requeue_deep_pending_all")}" '
         f'style="display:inline-block;" '
-        f'onsubmit="return confirm(\'This force re-queues every track currently marked '
-        f'\\\'deep scan queued\\\', including ones that may still be legitimately '
-        f'running or waiting in line. Only do this if you are sure those scans are '
-        f'actually stuck (for example after a worker crash) - otherwise it will '
-        f'duplicate in-flight scans. Continue?\');">'
+        f'onsubmit="return confirm(\'This re-queues every FAILED deep scan and every '
+        f'LEGACY deep scan (queued before the claim model existed). Scans that are '
+        f'still queued or running are left alone. Continue?\');">'
         f'<button type="submit" class="btn" style="{BTN_STYLE}" '
-        f'title="Force re-queue every track currently flagged deep_pending right now, '
-        f'regardless of how long ago it was queued. Bypasses the automatic recovery '
-        f'timeout in Settings.">Force re-queue all pending deep scans</button></form>'
-        '<p style="font-size:.8rem;color:#dc2626;margin:.3rem 0 0;">'
-        '&#9888; Use carefully: this re-queues every track currently marked '
-        '&ldquo;deep scan queued&rdquo;, including any that may still be legitimately '
-        'running or waiting in line. Only use it when you are sure those scans are '
-        'actually stuck (e.g. after a worker crash) &mdash; otherwise you will get '
-        'duplicate scans.</p>')
+        f'title="Re-queue every deep scan whose claim is marked failed, plus every '
+        f'legacy deep scan with no claim metadata. Live scans are never touched.">'
+        f'Re-queue failed and legacy deep scans</button></form>'
+        '<p style="font-size:.8rem;color:#6b7280;margin:.3rem 0 0;">'
+        'Failed scans are safe to re-queue: the original attempt already ended. '
+        'Legacy scans predate the claim model, so their outcome is unknown &mdash; '
+        'if one is still running you will get a duplicate scan.</p>')
+        if (deep_failed or deep_legacy) else '')
+    if deep_unknown:
+        requeue_pending_block += (
+            f'<form method="post" action="{url_for("spectrum_analyzer.requeue_deep_pending_unknown")}" '
+            f'style="display:inline-block;margin-left:.6rem;" '
+            f'onsubmit="return confirm(\'This re-queues every deep scan whose queue '
+            f'outcome could not be established. The original scan may still be '
+            f'queued or running somewhere, so re-queueing may run it TWICE. '
+            f'Continue?\');">'
+            f'<input type="hidden" name="confirm" value="1">'
+            f'<button type="submit" class="btn" style="{BTN_STYLE}" '
+            f'title="Re-queue every deep scan whose queue outcome is unknown. '
+            f'The scan may run twice.">Retry despite unknown outcome '
+            f'(&times;{deep_unknown})</button></form>')
 
     # The bulk buttons hand off to an orchestrator task rather than queueing
     # the tracks themselves (see _enqueue_bulk), so the count is not known here
@@ -436,25 +528,34 @@ def home():
                        '&mdash; tracks are queued in batches, follow progress under '
                        'Active Tasks.</p>')
 
-    def _album_tags(ver, pending):
+    def _album_tags(ver, pending, pending_failed, pending_unknown):
         tags = ''
         if pending:
+            extra = ''
+            if pending_failed:
+                extra += f' ({pending_failed} failed'
+            if pending_unknown:
+                extra += (f', {pending_unknown} unknown' if pending_failed
+                          else f' ({pending_unknown} unknown')
+            if extra:
+                extra += ')'
             tags += ('<span style="background:#f59e0b;color:#fff;border-radius:4px;'
                      'padding:.05rem .4rem;font-size:.75rem;margin-left:.4rem;'
-                     'white-space:nowrap;" title="Tracks with a deep scan queued or '
-                     f'running">deep scan &times;{pending}</span>')
+                     'white-space:nowrap;" title="Tracks with a deep scan queued, '
+                     f'running, failed or of unknown outcome">deep scan '
+                     f'&times;{pending}{extra}</span>')
         if ver:
             tags += ('<span style="background:#16a34a;color:#fff;border-radius:4px;'
-                     'padding:.05rem .4rem;font-size:.75rem;margin-left:.4rem;'
-                     'white-space:nowrap;" title="Manually verified tracks">'
-                     f'verified &times;{ver}</span>')
+                      'padding:.05rem .4rem;font-size:.75rem;margin-left:.4rem;'
+                      'white-space:nowrap;" title="Manually verified tracks">'
+                      f'verified &times;{ver}</span>')
         return tags
 
     album_rows = ''.join(
         '<tr>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;">'
         f'<a href="{_esc(url_for("spectrum_analyzer.album", name=album or ""))}">{_esc(album) or "(no album)"}</a>'
-        f'{_album_tags(ver, pending)}</td>'
+        f'{_album_tags(ver, pending, pending_failed, pending_unknown)}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;">{count}</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;'
         f'color:{"#dc2626" if bad else "#16a34a"};font-weight:600;">{bad}</td>'
@@ -465,10 +566,13 @@ def home():
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;text-align:right;">{_khz(min_cut)} kHz</td>'
         f'<td style="padding:.3rem .6rem;border-top:1px solid #ccc;">{_esc(last)}</td>'
         '</tr>'
-        for album, count, bad, low, ver, pending, min_cut, last in rows)
+        for album, count, bad, low, ver, pending, pending_failed,
+        pending_unknown, min_cut, last in rows)
 
     def page_url(p):
-        params = {'q': q, 'min_bad': min_bad, 'min_conf': min_conf, 'max_conf': max_conf, 'p': p, 'v': sel_verdicts}
+        params = {'q': q, 'min_bad': min_bad, 'min_conf': min_conf, 'p': p, 'v': sel_verdicts}
+        if max_conf is not None:
+            params['max_conf'] = max_conf
         if verified_only:
             params['verified'] = 1
         if unverified_only:
@@ -511,7 +615,7 @@ def home():
         f'<label style="white-space:nowrap;margin-left:.6rem;" title="Show only albums containing at '
         f'least one track whose verdict confidence is at most this percentage">'
         f'max confidence % <input type="number" name="max_conf" min="0" max="100" '
-        f'value="{max_conf}" style="width:4rem;"></label>'
+        f'value="{"" if max_conf is None else max_conf}" style="width:4rem;"></label>'
         f'<label style="white-space:nowrap;"><input type="checkbox" name="verified" '
         f'value="1" {"checked" if verified_only else ""}> only albums with verified tracks</label>'
         f'<button type="submit" class="btn" style="{BTN_STYLE}">Filter</button></div>'
@@ -561,11 +665,16 @@ def album():
         min_conf = max(0, min(100, int(request.args.get('min_conf', 0) or 0)))
     except ValueError:
         min_conf = 0
+    # omitted/empty max_conf is NO upper bound (None); an explicit 0 is a real
+    # bound (zero-confidence INCONCLUSIVE results are valid filter targets)
+    raw_max = request.args.get('max_conf')
     try:
-        max_conf = max(0, min(100, int(request.args.get('max_conf', 0) or 0)))
+        max_conf = (max(0, min(100, int(raw_max)))
+                    if raw_max not in (None, '') else None)
     except ValueError:
-        max_conf = 0
-    filtered = bool(sel_verdicts or min_conf or max_conf or unverified_only)
+        max_conf = None
+    filtered = bool(sel_verdicts or min_conf or max_conf is not None
+                    or unverified_only)
 
     where = ['album = %s']
     params = [name]
@@ -575,7 +684,7 @@ def album():
     if min_conf:
         where.append('confidence >= %s')
         params.append(min_conf / 100.0)
-    if max_conf:
+    if max_conf is not None:
         where.append('confidence <= %s')
         params.append(max_conf / 100.0)
     if unverified_only:
@@ -601,7 +710,7 @@ def album():
     if min_conf:
         count_where.append('confidence >= %s')
         count_params.append(min_conf / 100.0)
-    if max_conf:
+    if max_conf is not None:
         count_where.append('confidence <= %s')
         count_params.append(max_conf / 100.0)
     count_sql = ' WHERE ' + ' AND '.join(count_where)
@@ -613,7 +722,8 @@ def album():
         'SELECT item_id, title, artist, suffix, bitrate, sample_rate, cutoff_hz,'
         ' edge_db_khz, verdict, est_source, confidence, details,'
         ' to_char(analyzed_at, \'DD-MM-YYYY HH24:MI\'), spectrogram_b64, album_id,'
-        ' container_bits, effective_bits, verified, deep_pending, deep_eligible'
+        ' container_bits, effective_bits, verified, deep_pending, deep_eligible,'
+        ' deep_claim_state'
         ' FROM ' + tbl + ' WHERE ' + ' AND '.join(where) + ' ORDER BY title',
         tuple(params))
     rows = cur.fetchall()
@@ -622,7 +732,7 @@ def album():
     cards = []
     for (item_id, title, artist, suffix, bitrate, sr, cutoff, edge, verdict,
          est, conf, details, when, png, _aid, cbits, ebits, verified,
-         deep_pending, deep_eligible) in rows:
+         deep_pending, deep_eligible, deep_claim_state) in rows:
         if cbits and ebits and ebits < cbits:
             bits = (f' / <span style="color:#dc2626;font-weight:600;" '
                     f'title="effective bits / container bits">{ebits}&rarr;{cbits} bit</span>')
@@ -642,11 +752,7 @@ def album():
             f'value="{_esc(item_id)}" class="bulk-select-cb" style="margin-right:.5rem;">'
             f'<strong>{_esc(title)}</strong> <span style="color:#6b7280;">'
             f'{_esc(artist)} &middot; {fmt}</span></div>'
-            f'<div>{_badge(verdict, conf)}'
-            + ('<span style="background:#f59e0b;color:#fff;border-radius:4px;'
-               'padding:.1rem .45rem;font-size:.8rem;margin-left:.4rem;white-space:nowrap;" '
-               'title="A deep scan is queued or running for this track">'
-               'deep scan queued</span>' if deep_pending else '')
+            f'<div>{_badge(verdict, conf)}{_deep_badge(deep_pending, deep_claim_state)}'
             + f'<form method="post" action="{url_for("spectrum_analyzer.verify", item_id=item_id)}" '
             f'style="display:inline;margin-left:.6rem;">'
             f'<label style="white-space:nowrap;font-size:.85rem;" '
@@ -712,7 +818,7 @@ def album():
         + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
           f'title="Show only tracks with verdict confidence at most this percentage">'
           f'max confidence % <input type="number" name="max_conf" min="0" max="100" '
-          f'value="{max_conf}" style="width:4rem;"></label>'
+          f'value="{"" if max_conf is None else max_conf}" style="width:4rem;"></label>'
         + f'<label style="white-space:nowrap;font-size:.85rem;margin-left:.4rem;" '
           f'title="Hide manually verified tracks">'
           f'<input type="checkbox" name="unv" value="1" '
@@ -798,24 +904,19 @@ def rescan(item_id):
 
 @bp.route('/deep_rescan/<item_id>', methods=['POST'])
 def deep_rescan(item_id):
-    # tag first so the page shows "deep scan queued" immediately; the job
-    # clears the flag when it finishes. The NOT deep_pending guard makes the
-    # button idempotent: repeat clicks while a scan is queued enqueue nothing.
-    db = get_db()
-    cur = db.cursor()
-    cur.execute('UPDATE ' + table('results') + ' SET deep_pending=TRUE, deep_pending_since=now()'
-                ' WHERE item_id=%s AND NOT deep_pending AND deep_eligible'
-                ' RETURNING item_id',
-                (item_id,))
-    tagged = cur.fetchone()
-    db.commit()
-    cur.close()
-    if tagged:
+    # claim first so the page shows "deep scan queued" immediately; the child
+    # completes the claim when the analysis lands. The NOT deep_pending guard
+    # inside the claim makes the button idempotent: repeat clicks while a scan
+    # is queued enqueue nothing.
+    claim_id = jobs.claim_deep(item_id, queue='high')
+    if claim_id:
         try:
-            _enqueue(jobs.analyze_track_job, item_id, deep=True, queue='high')
+            handle = _enqueue(jobs.analyze_track_job, item_id, deep=True,
+                              claim_id=claim_id, queue='high')
         except _QueueRefused as exc:
-            _untag_deep_pending([item_id])
+            jobs._clear_deep_claims_many([(item_id, claim_id)])
             return _queue_refused_page(exc)
+        jobs._attach_deep_task(item_id, claim_id, handle)
     return redirect(request.referrer or url_for('spectrum_analyzer.home'))
 
 
@@ -848,11 +949,29 @@ def deep_rescan_selected():
 
 @bp.route('/deep_pending/requeue_all', methods=['POST'])
 def requeue_deep_pending_all():
-    # select='requeue_all': deliberately re-claims rows that ARE tagged, the
-    # escape hatch for scans the user knows are stuck. Not automatic, because
-    # re-queuing one that is merely slow means analyzing it twice.
+    # select='requeue_all': re-claims rows with no claim metadata at all
+    # (legacy) or whose claim is already marked failed. Live claims match the
+    # select, so this can never replace a scan that may still be running. Not
+    # automatic, because re-queuing one that is merely slow means analyzing
+    # it twice.
     try:
         _enqueue_bulk(select='requeue_all', deep=True)
+    except _QueueRefused as exc:
+        return _queue_refused_page(exc, url_for('spectrum_analyzer.home'))
+    return redirect(url_for('spectrum_analyzer.home', started='requeue'))
+
+
+@bp.route('/deep_pending/requeue_unknown', methods=['POST'])
+def requeue_deep_pending_unknown():
+    # select='requeue_unknown': re-claims rows whose claim has no attached
+    # queue task, or whose outcome the reconciler could not establish. The
+    # child may in fact still be queued or running somewhere, so this route
+    # only accepts an explicit duplicate-risk confirmation: the scan may run
+    # twice.
+    if request.form.get('confirm') != '1':
+        return redirect(request.referrer or url_for('spectrum_analyzer.home'))
+    try:
+        _enqueue_bulk(select='requeue_unknown', deep=True)
     except _QueueRefused as exc:
         return _queue_refused_page(exc, url_for('spectrum_analyzer.home'))
     return redirect(url_for('spectrum_analyzer.home', started='requeue'))
@@ -925,7 +1044,7 @@ def settings():
                                   ('drop_db', 20, 70, 40),
                                   ('img_w', 400, 2000, 800),
                                   ('img_h', 160, 800, 280),
-                                  ('deep_orphan_ttl_hours', 1, 168, 2)):  # 1h-7d, default 2h
+                                  ('deep_pending_warning_hours', 1, 168, 2)):  # 1h-7d, default 2h
             try:
                 set_setting(key, max(lo, min(hi, int(request.form.get(key, dflt)))))
             except (TypeError, ValueError):
@@ -951,8 +1070,11 @@ def settings():
         + num('img_w', 800, 'Spectrogram width (px)', '')
         + num('img_h', 280, 'Spectrogram height (px)',
               'bigger images mean more base64 in the database')
-        + num('deep_orphan_ttl_hours', 2, 'Deep scan orphan timeout (hours)',
-              'hours a stuck "deep scan queued" flag sits before it\'s auto re-queued; must exceed worst-case queue wait')
+        + num('deep_pending_warning_hours',
+              get_setting('deep_pending_warning_hours',
+                          get_setting('deep_orphan_ttl_hours', 2)),
+              'Deep scan warning threshold (hours)',
+              'hours before the reconciler flags a deep scan whose queue outcome it cannot establish; it only warns, it never re-queues')
         + f'<label style="display:block;margin:.6rem 0;">'
           f'<input type="checkbox" name="hook_enabled" {hook}> '
           'Also analyze songs automatically during core analysis (on_song_analyzed hook)</label>'
@@ -972,5 +1094,9 @@ def register(ctx):
     # high queue: the orchestrator must not occupy the default workers its
     # per-album child jobs run on
     ctx.add_task('scan_changed', jobs.scan_changed_task, queue='high')
-    ctx.add_task('recover_deep_pending', jobs.recover_deep_pending_task, queue='high')
+    # task name kept from the old orphan-recovery cron (existing enabled rows
+    # resolve by name); the function is now the claim reconciler, which never
+    # re-queues
+    ctx.add_task('recover_deep_pending', jobs.reconcile_deep_pending_task,
+                 queue='high')
     ctx.on_song_analyzed(jobs.on_song_analyzed)

@@ -63,6 +63,51 @@ plugin builds on. Everything below still works on 2.6.2 and every 3.x.
   3.8's C extensions are built against the numpy 1.x ABI and fail to import
   under numpy 2, and pip does not upgrade an already-satisfied requirement.
 
+### Queue-aware deep-scan recovery
+
+The deep-scan "pending" tag was previously recovered by age alone: a track
+still tagged after the orphan TTL was re-queued. That treated time as proof a
+child was lost, which is wrong now that the queue lives in Postgres — the core
+persists queued work and reclaims work whose worker died, so a restart needs no
+plugin intervention. Recovery is now a bounded reconciler that only settles the
+plugin's own claim markers and never auto-retries an uncertain outcome.
+
+- **Each deep scan is owned by a claim.** Queuing a deep scan (per-track button
+  or a bulk action) writes a distinct `deep_claim_id` plus the queued child's
+  id, the queue generation (`postgres`/`rq`), and a state
+  (`claimed`/`launched`/`running`/`failed`/`outcome_unknown`). Every deep-state
+  write is fenced on that claim id, so a stale or superseded child can never
+  clear a newer claim. `deep_pending` stays set for every active, failed,
+  unknown and legacy claim, so the existing boolean deep controls keep
+  disabling; retry eligibility is now state-aware.
+- **A failed launch no longer strands tags.** A bulk launch failure
+  (`_LaunchFailed`) cleans only the never-enqueued normal claims and restores
+  the prior record for never-enqueued force-requeue claims (compare-and-set on
+  the fresh claim id), then re-raises the original cause so the parent task
+  stays FAILURE.
+- **The recovery cron is a reconciler, not a retryer.** `recover_deep_pending`
+  (name kept, so existing enabled schedules keep working) reads each owned
+  claim's real queue state and only settles the plugin's markers: a confirmed
+  success or cancel clears the claim, a confirmed failure marks it `failed`,
+  and a missing/unreadable row or a task-less claim past the warning grace
+  becomes `outcome_unknown`. It never re-queues. A retry is always an explicit
+  user action — failed claims use the normal confirmed retry, unknown/task-less
+  claims require a separately labelled "retry despite unknown outcome"
+  confirmation that warns duplicate work may occur, and live/unreadable claims
+  have no retry control.
+- **The TTL setting is now a warning.** `deep_orphan_ttl_hours` is renamed
+  `deep_pending_warning_hours` (value migrated); it only warns about stale
+  claims and never selects work for enqueue.
+
+### Branch remediation
+
+- `ANALYSIS_REV` bumped to 7 so rows stamped under r6 are re-analysed under the
+  result-changing ffmpeg decode fallback.
+- RQ status lookup is conservative: only `NoSuchJobError` frees a throttle slot.
+- Overview confidence filtering preserves an explicit `max_conf=0`, treats an
+  omitted/empty value as "no bound", and applies both bounds to one matching
+  track.
+
 ### Also
 
 - Album and library overviews gained a **max confidence %** filter alongside the
