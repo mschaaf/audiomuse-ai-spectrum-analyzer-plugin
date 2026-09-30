@@ -35,12 +35,22 @@ Before invoking Codex, turn the user's request into a focused prompt that:
 - Requires explicit uncertainty and test gaps when proof is unavailable.
 - Prohibits making changes unless the user explicitly requested implementation.
 
-Invoke the CLI non-interactively using `codex exec` from the repository root. For
-a continuation, use Codex's non-interactive session-resume command with the
-retained session identifier. Pass the complete prompt as one argument without
+Invoke the CLI non-interactively using `codex exec` from the repository root in
+`workspace-write` sandbox mode: pass `-s workspace-write` so Codex can write
+files (scratch output, test fixtures) to the current repository and /tmp, and
+nothing else. This is the least-privilege write mode — it does not grant access
+to the rest of the filesystem. For a continuation, use Codex's non-interactive
+session-resume command with the retained session identifier; the resume
+subcommand does not accept `-s` and inherits the same `workspace-write` default,
+so no extra flag is needed. Pass the complete prompt as one argument without
 putting secrets, credentials, or unrelated local data into it. If the CLI is
 unavailable, authentication fails, or the session cannot be resumed, report that
 failure and do not substitute an invented Codex response.
+
+Prefer `workspace-write` over `--dangerously-bypass-approvals-and-sandbox`,
+which drops the sandbox and skips all approval prompts entirely (unrestricted
+filesystem and network access). For pure read-only inspection, use
+`-s read-only` instead.
 
 Return Codex's substantive response to the user, clearly identified as external
 consultation. Distinguish Codex's claims from facts independently verified in
