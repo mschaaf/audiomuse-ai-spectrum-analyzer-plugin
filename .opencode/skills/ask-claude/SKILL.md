@@ -35,12 +35,19 @@ Before invoking Claude, turn the user's request into a focused prompt that:
 - Requires explicit uncertainty and test gaps when proof is unavailable.
 - Prohibits making changes unless the user explicitly requested implementation.
 
-Invoke the CLI non-interactively using `claude -p` from the repository root. For
-a continuation, use Claude's session-resume capability with the retained session
-identifier. Pass the complete prompt as one argument without putting secrets,
-credentials, or unrelated local data into it. If the CLI is unavailable,
-authentication fails, or the session cannot be resumed, report that failure and
-do not substitute an invented Claude response.
+Invoke the CLI non-interactively using `claude -p --permission-mode acceptEdits`
+from the repository root. The `--permission-mode acceptEdits` flag is required:
+in non-interactive `-p` mode there is no one to answer a tool-permission prompt,
+so without it Claude's Write/Edit tools are silently blocked and any requested
+file output (e.g. an overview written to a `.txt` file) is never produced even
+though Claude reports the analysis in its response. `acceptEdits` auto-approves
+file writes/edits while still gating other actions like arbitrary Bash, which
+matches this skill's read-mostly consultation posture. For a continuation, use
+Claude's session-resume capability with the retained session identifier. Pass
+the complete prompt as one argument without putting secrets, credentials, or
+unrelated local data into it. If the CLI is unavailable, authentication fails,
+or the session cannot be resumed, report that failure and do not substitute an
+invented Claude response.
 
 Return Claude's substantive response to the user, clearly identified as external
 consultation. Distinguish Claude's claims from facts independently verified in
