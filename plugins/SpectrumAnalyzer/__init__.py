@@ -96,8 +96,9 @@ def migrate(db):
                 ' ADD COLUMN IF NOT EXISTS deep_pending_since TIMESTAMP')
     # 0.4.0: queue-aware deep claim model. Each deep scan owns a claim id;
     # the state tracks claimed -> launched -> running -> (cleared | failed |
-    # outcome_unknown), and the backend records which queue generation the
-    # child went into so the reconciler reads its status from the right place.
+    # outcome_unknown), and the backend records which queue the child went
+    # into: 'postgres' is read back from the queue, 'rq' (the retired RQ queue)
+    # is only ever quarantined by the reconciler.
     # Existing pending rows are NOT backfilled: a deep_pending with a NULL
     # deep_claim_id is legacy-ambiguous and stays manual-retry-only.
     for col in ('deep_claim_id TEXT', 'deep_task_id TEXT',
@@ -142,7 +143,7 @@ def migrate(db):
 
 
 def _migrate_v3_ids(db, cur, tbl):
-    """AudioMuse-AI 3.0 compatibility (0.3.0). Idempotent; safe on 2.x.
+    """AudioMuse-AI 3.0 compatibility (0.3.0). Idempotent.
 
     3.0 rewrote score.item_id from native media-server ids to canonical fp_
     ids (track_server_map translates). Steps, in a deliberate order:
@@ -227,15 +228,15 @@ class _QueueRefused(Exception):
 def _enqueue(*args, **kwargs):
     """`enqueue()`, with a refusal turned into something a route can render.
 
-    From 3.2 the core refuses a plugin enqueue issued from the web process
-    while ANY queue job is live — a core analysis, a cleaning run, another
-    plugin's task, or one of our own scans — and raises. Unhandled that is a
-    500 on a button click, so every route queues through here. A job already
-    running on a worker is exempt (it holds the guard), which is why the
-    parent scan can still fan its album children out from inside itself.
+    The core refuses a plugin enqueue issued from the web process while ANY
+    queue job is live — a core analysis, a cleaning run, another plugin's task,
+    or one of our own scans — and raises. Unhandled that is a 500 on a button
+    click, so every route queues through here. A job already running on a
+    worker is exempt (it holds the guard), which is why the parent scan can
+    still fan its album children out from inside itself.
 
-    Returns the core's enqueue handle (the queue task id on 3.2+, an RQ Job
-    before) so a route that claimed a deep scan can attach it to the claim.
+    Returns the core's enqueue handle (the queue task id) so a route that
+    claimed a deep scan can attach it to the claim.
     """
     try:
         return enqueue(*args, **kwargs)
@@ -247,7 +248,7 @@ def _enqueue(*args, **kwargs):
 def _enqueue_bulk(item_ids=None, album=None, select=None, deep=False):
     """Hand a bulk track action to one orchestrator task and return.
 
-    A route CANNOT loop over `enqueue()`: from 3.2 the core consults the queue
+    A route CANNOT loop over `enqueue()`: the core consults the queue
     guard on every enqueue made from the web process, and the guard counts live
     `plugin.%` roots — so the first track queued blocks the second. The
     orchestrator runs on the high queue and fans the tracks out from inside a
@@ -876,7 +877,7 @@ def scan():
     # the orchestrator lives on the high queue so its per-album children
     # (default queue) can be picked up by every default worker in parallel;
     # all_servers: a manual scan covers every configured media server, not
-    # just the default one (no-op on a single-server / 2.x install).
+    # just the default one (no-op on a single-server install).
     # No task row is created here: the job keys its own row by the id the core
     # queued it under (jobs._current_task_id), which is the only id the core's
     # own bookkeeping — its Cancel button, its orphan sweeps — agrees with
@@ -908,7 +909,7 @@ def deep_rescan(item_id):
     # completes the claim when the analysis lands. The NOT deep_pending guard
     # inside the claim makes the button idempotent: repeat clicks while a scan
     # is queued enqueue nothing.
-    claim_id = jobs.claim_deep(item_id, queue='high')
+    claim_id = jobs.claim_deep(item_id)
     if claim_id:
         try:
             handle = _enqueue(jobs.analyze_track_job, item_id, deep=True,

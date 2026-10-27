@@ -38,12 +38,15 @@ import time
 import uuid
 from datetime import timedelta
 
+import taskqueue
 from plugin.api import (
     config, enqueue, get_db, get_setting, table, logger, save_task_status,
+    active_server_id, list_servers, use_server,
     TASK_STATUS_PENDING, TASK_STATUS_STARTED, TASK_STATUS_PROGRESS,
     TASK_STATUS_SUCCESS, TASK_STATUS_FAILURE, TASK_STATUS_REVOKED,
 )
 from tasks.mediaserver import get_recent_albums, get_tracks_from_album, download_track
+from tasks.mediaserver.registry import reverse_translate_ids, translate_ids
 
 from . import dsp
 
@@ -51,7 +54,11 @@ TASK_TYPE = 'plugin.spectrum_analyzer.scan'
 ALBUM_TASK_TYPE = 'plugin.spectrum_analyzer.scan_album'
 BULK_TASK_TYPE = 'plugin.spectrum_analyzer.bulk_analyze'
 
-COUNTER_KEYS = ('analyzed', 'skipped', 'unchanged', 'not_in_score', 'error')
+# 'unmapped': a track the media server has but the registry cannot map to a
+# catalogue id on that server (e.g. a secondary server's track the core has
+# not catalogued). Such tracks are skipped, not analyzed under a native id.
+COUNTER_KEYS = ('analyzed', 'skipped', 'unchanged', 'not_in_score', 'error',
+                'unmapped')
 TERMINAL_STATES = (TASK_STATUS_SUCCESS, TASK_STATUS_FAILURE, TASK_STATUS_REVOKED)
 POLL_SECONDS = 5
 
@@ -63,137 +70,80 @@ _FP_KEYS = ('path', 'Path', 'size', 'Size', 'suffix', 'Container',
 
 
 # ------------------------------------------------- canonical-id translation --
-# AudioMuse-AI 3.0 keys `score` by canonical fingerprint ids (fp_...) and maps
-# them to native media-server ids in `track_server_map`. Media-server track
-# dicts still carry native ids in 'Id'/'id', so everything we store is keyed by
-# the canonical id and translated at the edges. On a pre-3.0 core the registry
-# module does not exist and both directions collapse to identity/no-op.
+# AudioMuse-AI keys `score` by canonical ids (fp_...) and maps them to native
+# media-server ids in `track_server_map`. Media-server track dicts still carry
+# native ids in 'Id'/'id', so everything we store is keyed by the canonical id
+# and translated at the edges.
 
 def _active_server_id():
-    try:
-        from plugin.api import active_server_id
-    except ImportError:
-        return None  # pre-3.0 core: single server
-    try:
-        return active_server_id()
-    except Exception:
-        return None
+    return active_server_id()
 
 
 def _list_server_ids():
-    """Every configured server's id, default first; [None] on 2.x or failure
-    (None = the lone/default server everywhere in this module)."""
-    try:
-        from plugin.api import list_servers
-    except ImportError:
-        return [None]
+    """Every configured server's id, default first; [None] when the registry
+    cannot be read (None = the default server everywhere in this module)."""
     try:
         ids = [s.get('server_id') for s in list_servers()]
-        return [i for i in ids if i] or [None]
     except Exception:
         logger.exception('spectrum_analyzer: listing servers failed')
         return [None]
+    return [i for i in ids if i] or [None]
 
 
 def _current_task_id():
-    """The queue's own id for the running job, to key our task_status row by.
+    """The queue's id for the running job, to key our task_status row by.
 
-    A top-level job's row MUST carry the id the core queued the job under, and
-    the two queue generations disagree about what that id is:
-
-    3.2+ (Postgres queue) — `taskqueue.current_task_id()`. The row already
-      exists when the task starts (`enqueue()` writes it), so keying by this
-      updates that row in place instead of adding a second one beside it. It is
-      also the row the Cancel button replaces with a REVOKED tombstone, which is
-      what `revoked()` polls for, and a row the queue owns (`func` is set) is
-      never touched by the stale-in-process sweep.
-    2.x/3.0-3.1 (RQ) — the RQ job id, for the mirror-image reason: that
-      core's janitor failed any top-level non-terminal row whose id `Job.fetch`
-      could not find, so a self-invented uuid got reaped mid-scan.
-
-    Either way routes must not pre-create the row: run_plugin_task looks it up
-    by the job id before the task runs and, when it exists, overwrites it with a
-    bare SUCCESS (details wiped) afterwards. The job creates its own row.
+    The row already exists when the task starts, so keying by this updates it in
+    place. Routes must not pre-create the row. None outside a queue run.
     """
-    try:
-        import taskqueue
-        task_id = taskqueue.current_task_id()   # 3.2+
-        if task_id:
-            return str(task_id)
-    except Exception:
-        pass
-    try:
-        from rq import get_current_job          # <= 3.1 (rq is gone in 3.2)
-        job = get_current_job()
-        return job.id if job is not None else None
-    except Exception:
-        return None
+    task_id = taskqueue.current_task_id()
+    return str(task_id) if task_id else None
 
 
-def _queue_backend():
-    """Which queue generation is running: the 3.2+ Postgres queue or legacy RQ.
-
-    The single generation detector: claim creation, task attachment and the
-    reconciler all classify through this, so they cannot disagree about which
-    status adapter to use. The `taskqueue` module exists only on 3.2+; before
-    that the queue is RQ (and `rq` is not installed from 3.2, so the two
-    imports are mutually exclusive in practice).
-    """
-    try:
-        import taskqueue  # noqa: F401
-        return 'postgres'
-    except Exception:
-        return 'rq'
+def _job_task_id(task_id, job_name):
+    """The explicit task id a parent passed, else the queue's id for this run.
+    Refuses to run with neither: an id nothing polls is never invented."""
+    task_id = task_id or _current_task_id()
+    if not task_id:
+        raise RuntimeError(f'{job_name} has no task id: run it on the task '
+                           'queue or pass task_id')
+    return task_id
 
 
 def _bind_server(server_id):
     """Context manager binding every media-server call in scope to server_id.
 
-    The core's binding is a contextvar, which does NOT cross RQ job boundaries:
-    a child job never inherits the parent's binding, so every job that lists,
+    The core's binding is a contextvar, which does NOT cross job boundaries: a
+    child job never inherits the parent's binding, so every job that lists,
     matches or downloads tracks must bind the server it was planned against
-    itself. No-op (default server) when server_id is None or on a 2.x core.
+    itself. No-op (default server) when server_id is None.
     """
     if not server_id:
-        return contextlib.nullcontext()
-    try:
-        from plugin.api import use_server
-    except ImportError:
         return contextlib.nullcontext()
     return use_server(server_id)
 
 
 def _native_to_fp(native_ids, server_id=None):
-    """{native_id: canonical id}. Identity mapping on a pre-3.0 core."""
+    """{native_id: canonical id} for the ids the registry maps on server_id.
+
+    An id the registry leaves out is absent from the result, so the caller can
+    tell an unmapped track from a mapped one. A registry failure raises: keying
+    rows by the native id instead would store them under an id score never uses.
+    """
     ids = [str(i) for i in native_ids if i]
     if not ids:
         return {}
-    try:
-        from tasks.mediaserver.registry import reverse_translate_ids
-    except ImportError:
-        return {i: i for i in ids}
-    try:
-        mapped = reverse_translate_ids(ids, server_id=server_id)
-    except Exception:
-        logger.exception('spectrum_analyzer: native->canonical translation failed')
-        return {i: i for i in ids}
-    return {i: str(mapped.get(i, i)) for i in ids}
+    mapped = reverse_translate_ids(ids, server_id=server_id)
+    return {str(k): str(v) for k, v in mapped.items()}
 
 
 def _fp_to_native(fp_ids, server_id=None):
-    """{canonical id: native provider id} for this server; {} on a pre-3.0 core."""
+    """{canonical id: native provider id} for the ids present on server_id."""
     ids = [str(i) for i in fp_ids if i]
     if not ids:
         return {}
-    try:
-        from tasks.mediaserver.registry import translate_ids
-    except ImportError:
-        return {}
-    try:
-        return {str(k): str(v) for k, v in translate_ids(ids, server_id=server_id).items()}
-    except Exception:
-        logger.exception('spectrum_analyzer: canonical->native translation failed')
-        return {}
+    mapped = translate_ids(ids, server_id=server_id)
+    return {str(k): str(v) for k, v in mapped.items()}
 
 
 def meta_fingerprint(track):
@@ -413,19 +363,16 @@ def _child_job_lost(handle):
     job has ended" and "the job was lost" are the same statement here: a child
     that finished normally wrote its terminal row before its job ended.
 
-    `enqueue()` hands back different things either side of the 3.2 queue
-    rewrite — the queue's task id (a str subclass) after it, an RQ Job before
-    it — so the check has to know both shapes.
+    `handle` is what `enqueue()` returned for the child: the queue's task id.
+    With no handle recorded there is nothing to check, so it is not lost.
     """
     if handle is None:
         return False
-    if isinstance(handle, str):
-        return _queue_job_over(str(handle))     # 3.2+
-    return _rq_job_lost(handle)                 # <= 3.1
+    return _queue_job_over(str(handle))
 
 
 def _queue_job_over(queue_task_id):
-    """True when a 3.2+ queue row has reached an end: terminal, or gone.
+    """True when a queue row has reached an end: terminal, or gone.
 
     Retention only ever deletes terminal rows, so a row that has disappeared
     ran to an end too. A queue row goes terminal strictly AFTER the child wrote
@@ -441,43 +388,10 @@ def _queue_job_over(queue_task_id):
     return state is None or state in TERMINAL_STATES
 
 
-def _rq_job_status_value(job):
-    """The lowercase status string of a live RQ job.
-
-    Reads the enum's .value rather than str(): rq 1.x JobStatus is a str-mixin
-    Enum whose str() form changed in Python 3.11, and rq 2.x is a plain Enum,
-    so only .value is stable across both. Raises whatever
-    job.get_status(refresh=True) raises (e.g. NoSuchJobError) so the caller
-    decides how to interpret a vanished or unreadable job.
-    """
-    status = job.get_status(refresh=True)
-    if status is None:
-        return ''
-    return getattr(status, 'value', str(status))
-
-
-def _rq_job_lost(job):
-    """True when the RQ job backing a child died without writing a terminal
-    task_status row (worker crash, job dropped from Redis). Pre-3.2 cores."""
-    try:
-        from rq.exceptions import NoSuchJobError
-    except ImportError:
-        NoSuchJobError = ()
-    try:
-        state = _rq_job_status_value(job)
-    except NoSuchJobError:
-        # a finished child writes its terminal row before the job expires,
-        # so a vanished job behind a non-terminal row means it was lost
-        return True
-    except Exception:
-        return False  # transient Redis error: decide on a later poll
-    return state in ('failed', 'stopped', 'canceled')
-
-
 def _touch_live_children(parent_task_id):
     """Refresh child rows going stale, so the core does not fail them for us.
 
-    A 3.2+ core fails any LIVE task_status row the queue does not own (`func IS
+    The core fails any LIVE task_status row the queue does not own (`func IS
     NULL`, which is every row written through save_task_status) once it has gone
     QUEUE_INLINE_STALE_SECONDS — 30 minutes by default — without an
     update. A running child rewrites its own row after every track, but a child
@@ -487,13 +401,7 @@ def _touch_live_children(parent_task_id):
     album was still waiting for a worker. Touching only the rows actually
     approaching the deadline keeps this a no-op UPDATE in the normal case.
     """
-    stale = getattr(config, 'QUEUE_INLINE_STALE_SECONDS', None)
-    if not stale:
-        return  # pre-3.2 core: no sweep to dodge
-    try:
-        refresh_after = max(60.0, float(stale) / 2.0)
-    except (TypeError, ValueError):
-        return
+    refresh_after = max(60.0, config.QUEUE_INLINE_STALE_SECONDS / 2.0)
     try:
         db = get_db()
         cur = db.cursor()
@@ -544,10 +452,13 @@ def _native_id(track):
 
 
 def _info_from_track(track, album, fp_map=None, server_id=None):
-    """fp_map: {native_id: canonical_id} from a per-album _native_to_fp batch;
-    item_id is the canonical id (identical to the native id on a v2 core)."""
+    """fp_map: {native_id: canonical_id} from a per-album _native_to_fp batch.
+
+    item_id is the canonical id, or None when fp_map has no entry for the track
+    (the registry does not map it on this server). Without an fp_map the native
+    id is the item id."""
     native = _native_id(track)
-    canonical = (fp_map or {}).get(native, native)
+    canonical = native if fp_map is None else fp_map.get(native)
     return {
         'item_id': canonical,
         'provider_track_id': native,
@@ -584,7 +495,7 @@ def scan_album_job(album_id, album_name, mode='changed', task_id=None,
     """Analyze one album. Child of scan_library_job (which passes the server it
     planned the album against), or standalone for the per-album Re-analyze
     button (mode=force, no parent; server recovered from the stored rows)."""
-    task_id = task_id or _current_task_id() or str(uuid.uuid4())
+    task_id = _job_task_id(task_id, 'scan_album_job')
     settings = _settings()
     rev = dsp.analysis_rev(settings['drop_db'], settings['segment_seconds'])
     counters = {k: 0 for k in COUNTER_KEYS}
@@ -626,6 +537,8 @@ def scan_album_job(album_id, album_name, mode='changed', task_id=None,
                                         fp_map, server_id)
                 item_id = info['item_id']
                 if not item_id:
+                    if _native_id(track):
+                        counters['unmapped'] += 1
                     continue
                 if item_id not in score_ids:
                     # not analyzed by the core yet -> no score row to attach to
@@ -671,8 +584,8 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
     The cron entry point keeps the default False: a schedule's server scope
     already runs the task once per server, bound by the core.
     """
-    task_id = task_id or _current_task_id() or str(uuid.uuid4())
-    max_in_flight = max(1, int(getattr(config, 'MAX_QUEUED_ANALYSIS_JOBS', 25)))
+    task_id = _job_task_id(task_id, 'scan_library_job')
+    max_in_flight = max(1, int(config.MAX_QUEUED_ANALYSIS_JOBS))
 
     def status(state, progress, detail, extra=None):
         try:
@@ -760,21 +673,24 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
                 try:
                     with _bind_server(sid):
                         tracks = get_tracks_from_album(album.get('Id'))
+                    fp_map = _native_to_fp([_native_id(t) for t in tracks], sid)
                 except Exception:
-                    logger.exception('spectrum_analyzer: album listing failed: %s',
+                    logger.exception('spectrum_analyzer: album planning failed: %s',
                                      album_name)
                     parent_counters['error'] += 1
                     albums_skipped += 1
                     done, progress, extra = snapshot(album_name)
                     status(TASK_STATUS_PROGRESS, progress,
-                           f'listing failed: {album_name}', extra)
+                           f'planning failed: {album_name}', extra)
                     continue
-                fp_map = _native_to_fp([_native_id(t) for t in tracks], sid)
                 pending = 0
-                tallies = {'skipped': 0, 'not_in_score': 0}
+                tallies = {'skipped': 0, 'not_in_score': 0, 'unmapped': 0}
                 for track in tracks:
-                    item_id = fp_map.get(_native_id(track))
+                    native = _native_id(track)
+                    item_id = fp_map.get(native)
                     if not item_id:
+                        if native:
+                            tallies['unmapped'] += 1
                         continue
                     if item_id not in score_ids:
                         tallies['not_in_score'] += 1
@@ -786,8 +702,11 @@ def scan_library_job(mode='changed', task_id=None, all_servers=False):
                         else:
                             pending += 1
                 if pending == 0:
+                    # a launched album's child counts these itself, so only the
+                    # settle-without-child path adds them here
                     parent_counters['skipped'] += tallies['skipped']
                     parent_counters['not_in_score'] += tallies['not_in_score']
+                    parent_counters['unmapped'] += tallies['unmapped']
                     albums_skipped += 1
                     # keep progress moving on the settle path too: a library of
                     # mostly-unchanged albums would otherwise show no update
@@ -861,48 +780,21 @@ def _queue_states(task_ids):
         return None
 
 
-def _rq_job_finished(job):
-    """Pre-3.2: has this RQ job stopped occupying a worker, however it ended?
-
-    Only a genuinely missing job frees the throttle slot. A transient Redis
-    error must keep the handle in flight: treating it as finished would let
-    the throttle launch past MAX_QUEUED_ANALYSIS_JOBS, and the job may still
-    run.
-    """
-    try:
-        from rq.exceptions import NoSuchJobError
-    except ImportError:
-        NoSuchJobError = ()
-    try:
-        state = _rq_job_status_value(job)
-    except NoSuchJobError:
-        return True
-    except Exception:
-        return False  # transient Redis error: decide on a later poll
-    return state in ('finished', 'failed', 'stopped', 'canceled')
-
-
 def _prune_finished(handles):
-    """Drop the finished jobs from {handle key: handle}; return how many remain.
+    """Drop the finished jobs from {task id: handle}; return how many remain.
 
-    `enqueue()` returns the queue's task id (a str subclass) on 3.2+ and an RQ
-    Job before that, so both shapes are pruned here -- the 3.2+ ones with a
-    single batched query rather than one per in-flight job.
+    One batched query for every in-flight job. A vanished row counts as
+    finished (see _queue_states).
     """
     if not handles:
         return 0
-    queue_ids = [key for key, h in handles.items() if isinstance(h, str)]
-    states = _queue_states(queue_ids) if queue_ids else {}
+    states = _queue_states(list(handles))
     if states is None:
         return len(handles)  # transient DB error: re-decide on the next poll
-    for key, handle in list(handles.items()):
-        if isinstance(handle, str):
-            state = states.get(key)
-            over = state is None or state in TERMINAL_STATES
-        else:
-            over = _rq_job_finished(handle)
-        if over:
-            handles.pop(key, None)
+    for task_id in list(handles):
+        state = states.get(task_id)
+        if state is None or state in TERMINAL_STATES:
+            handles.pop(task_id, None)
     return len(handles)
 
 
@@ -920,24 +812,13 @@ def _prune_finished(handles):
 CLAIM_LIVE_STATES = ('claimed', 'launched', 'running')
 
 
-def _claim_detail(kind, message='', queue=None):
+def _claim_detail(kind, message=''):
     d = {'kind': kind, 'message': message,
          'recorded_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-    if queue:
-        d['queue'] = queue
     return json.dumps(d)
 
 
-def _detail_queue(detail):
-    try:
-        d = json.loads(detail) if isinstance(detail, str) else (detail or {})
-        q = d.get('queue')
-        return q if isinstance(q, str) and q else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _new_deep_claims(item_ids=None, album=None, select=None, queue='default'):
+def _new_deep_claims(item_ids=None, album=None, select=None):
     """Claim untagged eligible tracks for a deep run.
 
     One UPDATE ... RETURNING so two clicks cannot claim the same track twice;
@@ -953,7 +834,7 @@ def _new_deep_claims(item_ids=None, album=None, select=None, queue='default'):
            ' deep_completed_claim_id=NULL, deep_completed_at=NULL,'
            ' deep_claim_detail=%s'
            ' WHERE NOT deep_pending AND deep_eligible')
-    params = [_queue_backend(), _claim_detail('queued', queue=queue)]
+    params = ['postgres', _claim_detail('queued')]
     ids = [str(i) for i in (item_ids or []) if i]
     if select == 'non_clean':
         sql += " AND verdict IS DISTINCT FROM 'CLEAN' AND NOT verified"
@@ -977,8 +858,8 @@ def _new_deep_claims(item_ids=None, album=None, select=None, queue='default'):
 def _requeue_claims(select):
     """Re-claim already-tagged rows for an explicit manual retry.
 
-    select='requeue_all'     rows with no claim metadata at all (legacy) or
-                             whose claim is already marked failed.
+    select='requeue_all'     rows with no claim id and no quarantine (legacy),
+                             or whose claim is already marked failed.
     select='requeue_unknown' rows whose claim has no attached queue task, or
                              whose outcome the reconciler could not establish.
                              The route requires a separate duplicate-risk
@@ -995,7 +876,8 @@ def _requeue_claims(select):
     """
     tbl = table('results')
     if select == 'requeue_all':
-        eligible = ('(deep_claim_id IS NULL OR deep_claim_state = \'failed\')')
+        eligible = ('((deep_claim_id IS NULL AND deep_claim_state IS DISTINCT FROM'
+                    ' \'outcome_unknown\') OR deep_claim_state = \'failed\')')
     elif select == 'requeue_unknown':
         eligible = ('(deep_task_id IS NULL OR deep_claim_state = '
                     '\'outcome_unknown\')')
@@ -1026,7 +908,7 @@ def _requeue_claims(select):
                 ' deep_claim_detail=%s'
                 ' WHERE item_id=%s AND deep_claim_id IS NOT DISTINCT FROM %s'
                 ' RETURNING deep_claim_id',
-                (_queue_backend(), _claim_detail('queued'), item_id, p_claim))
+                ('postgres', _claim_detail('queued'), item_id, p_claim))
             row = cur.fetchone()
             if row:
                 claims.append((item_id, row[0]))
@@ -1104,7 +986,7 @@ def _attach_deep_task(item_id, claim_id, handle):
     child finished and cleared the claim before the attach landed."""
     if not (claim_id and handle):
         return
-    task_id = str(getattr(handle, 'id', None) or handle)
+    task_id = str(handle)
     try:
         db = get_db()
         cur = db.cursor()
@@ -1213,47 +1095,20 @@ def _deep_claim_done(item_id, claim_id):
 def _clear_legacy_deep_pending(item_id):
     """Escape hatch for pre-claim rows only: a plain re-analysis, or a deep
     child queued by a pre-upgrade version (no claim id in its args), clears a
-    pending tag only when no claim owns the row."""
+    pending tag only when no claim owns the row and it was not quarantined."""
     try:
         db = get_db()
         cur = db.cursor()
         cur.execute('UPDATE ' + table('results') +
                     ' SET deep_pending=FALSE, deep_pending_since=NULL'
-                    ' WHERE item_id=%s AND deep_claim_id IS NULL', (item_id,))
+                    " WHERE item_id=%s AND deep_claim_id IS NULL"
+                    " AND deep_claim_state IS DISTINCT FROM 'outcome_unknown'",
+                    (item_id,))
         db.commit()
         cur.close()
     except Exception:
         logger.exception('spectrum_analyzer: could not clear legacy '
                          'deep_pending for %s', item_id)
-
-
-def _rq_job_state(job_id, queue_name='default'):
-    """Status of a legacy RQ job by id, for the reconciler.
-
-    Returns an RQ state string, 'missing' when the job is gone from Redis
-    (NoSuchJobError), or None when the status is unreadable (transport error,
-    rq absent). None and 'missing' are deliberately distinct: only a
-    confirmed-missing job may be treated as ended.
-    """
-    try:
-        from rq.job import Job
-        from rq.exceptions import NoSuchJobError
-        from redis import Redis
-    except ImportError:
-        return None
-    try:
-        # Job.fetch raises NoSuchJobError when the job key is gone and does not
-        # filter by origin (Queue.fetch_job would conflate a job that lives in
-        # another queue with a missing one). The default Redis() connection is
-        # the same one rq 1.x Queue(name) used.
-        job = Job.fetch(job_id, connection=Redis())
-        return _rq_job_status_value(job)
-    except NoSuchJobError:
-        return 'missing'
-    except Exception:
-        logger.exception('spectrum_analyzer: could not read RQ job %s '
-                         '(queue %s)', job_id, queue_name)
-        return None
 
 
 class _LaunchFailed(Exception):
@@ -1296,7 +1151,7 @@ def _launch_throttled(targets, deep, claim_ids=None, on_progress=None,
     `on_progress(launched, in_flight, waiting)` is called on every change of
     state.
     """
-    max_in_flight = max(1, int(getattr(config, 'MAX_QUEUED_ANALYSIS_JOBS', 25)))
+    max_in_flight = max(1, int(config.MAX_QUEUED_ANALYSIS_JOBS))
     targets = list(targets)
     claim_ids = claim_ids or {}
     handles = {}
@@ -1320,7 +1175,7 @@ def _launch_throttled(targets, deep, claim_ids=None, on_progress=None,
                              claim_id=claim_ids.get(item_id))
         except Exception as exc:
             raise _LaunchFailed(exc, launched, targets[i:])
-        handles[str(getattr(handle, 'id', None) or handle)] = handle
+        handles[str(handle)] = handle
         if deep:
             _attach_deep_task(item_id, claim_ids.get(item_id), handle)
         launched.append(item_id)
@@ -1345,7 +1200,7 @@ def bulk_analyze_job(item_ids=None, album=None, select=None, deep=False,
                      task_id=None):
     """Parent orchestrator for every bulk track action, on the *high* queue.
 
-    Exists because of the 3.2 queue guard: `plugin.api.enqueue()` refuses an
+    Exists because of the queue guard: `plugin.api.enqueue()` refuses an
     enqueue issued from the web process while any live `plugin.%` root exists,
     and the first track a route queues IS such a root -- so a route loop can
     only ever queue one track. A task already running on a worker is exempt, so
@@ -1359,7 +1214,7 @@ def bulk_analyze_job(item_ids=None, album=None, select=None, deep=False,
     failed launch cleans up exactly the claims that never reached the queue,
     and a re-queue run restores the prior record instead.
     """
-    task_id = task_id or _current_task_id() or str(uuid.uuid4())
+    task_id = _job_task_id(task_id, 'bulk_analyze_job')
     label = 'deep scan' if deep else 're-analysis'
     claim_ids = {}
     restore_map = {}
@@ -1396,8 +1251,7 @@ def bulk_analyze_job(item_ids=None, album=None, select=None, deep=False,
             if select in ('requeue_all', 'requeue_unknown'):
                 claims, restore_map = _requeue_claims(select)
             else:
-                claims = _new_deep_claims(item_ids, album, select,
-                                           queue='default')
+                claims = _new_deep_claims(item_ids, album, select)
         else:
             claims = [(str(i), None) for i in (item_ids or []) if i]
         targets = [item_id for item_id, _claim in claims]
@@ -1449,11 +1303,11 @@ def bulk_analyze_job(item_ids=None, album=None, select=None, deep=False,
         raise
 
 
-def claim_deep(item_id, queue='high'):
+def claim_deep(item_id):
     """Claim one track for a deep scan; its claim id, or None when the track
     is already tagged or not deep-eligible. The direct deep route uses this so
     the page updates immediately and the button stays idempotent."""
-    claims = _new_deep_claims(item_ids=[item_id], queue=queue)
+    claims = _new_deep_claims(item_ids=[item_id])
     return claims[0][1] if claims else None
 
 
@@ -1511,11 +1365,13 @@ def _analyze_track(item_id, deep):
     (title, artist, album, album_id, file_path, suffix, bitrate,
      provider_id, row_server) = row
     server_id = row_server or _active_server_id()
-    # the media server speaks native ids: stored provider id, else translate
-    # the canonical id, else item_id itself (v2 rows, where they are the same)
-    native = (provider_id
-              or _fp_to_native([item_id], server_id).get(item_id)
-              or item_id)
+    # the media server speaks native ids: the stored provider id, else the
+    # registry's translation of the canonical id on this server
+    native = provider_id or _fp_to_native([item_id], server_id).get(item_id)
+    if not native:
+        logger.warning('spectrum_analyzer: no media-server id for %s on server %s',
+                       item_id, server_id)
+        raise RuntimeError(f'no media-server id for {item_id} on server {server_id}')
 
     with _bind_server(server_id):
         # Prefer fresh metadata from the media server (also refreshes fingerprint)
@@ -1523,7 +1379,7 @@ def _analyze_track(item_id, deep):
         if album_id:
             try:
                 for t in get_tracks_from_album(album_id):
-                    if _native_id(t) in (native, item_id):
+                    if _native_id(t) == native:
                         track = t
                         break
             except Exception:
@@ -1583,14 +1439,58 @@ def _reconcile_settle(item_id, claim_id, state, detail=None):
                          'for %s', item_id)
 
 
+def _quarantine_legacy_backend(item_id, claim_id, backend):
+    """Mark a claim left on the retired RQ queue as outcome_unknown.
+
+    The fence on backend and claim id is NULL-safe (IS NOT DISTINCT FROM), so a
+    claimless row is reached too, while a fresh postgres claim or a re-claim is
+    not matched. A row already outcome_unknown keeps its original detail. The
+    completion markers are left as they are: nothing confirms a marker is the
+    RQ job's last word. Returns True when this call made the change.
+    """
+    db = None
+    cur = None
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            'UPDATE ' + table('results') +
+            " SET deep_claim_state='outcome_unknown', deep_claim_detail=%s"
+            ' WHERE item_id=%s AND deep_pending AND deep_queue_backend=%s'
+            ' AND deep_claim_id IS NOT DISTINCT FROM %s'
+            ' AND (deep_claim_state IS NULL OR deep_claim_state IN'
+            " ('claimed', 'launched', 'running', 'failed'))",
+            (_claim_detail('outcome_unknown', 'legacy RQ queue: outcome unknown'),
+             item_id, backend, claim_id))
+        ok = cur.rowcount > 0
+        db.commit()
+        return ok
+    except Exception:
+        logger.exception('spectrum_analyzer: could not quarantine legacy deep '
+                         'claim for %s', item_id)
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                logger.exception('spectrum_analyzer: rollback after a failed '
+                                 'quarantine also failed')
+        return False
+    finally:
+        if cur is not None:
+            cur.close()
+
+
 def reconcile_deep_pending_task():
     """Cron: reconcile deep claims against the queue. Never re-queues.
 
-    The core owns its queue: 3.2+ persists NEW work before a worker claims it
+    The core owns its queue: it persists NEW work before a worker claims it
     and reclaims dead RUNNING work, so a worker restart loses nothing the core
     has not already handled. What this reconciles is the plugin's own claim
     state, which the core cannot see:
 
+    - a claim recorded against the legacy RQ queue is quarantined as
+      outcome_unknown whatever its completion marker says, since RQ is no
+      longer read and its outcome cannot be confirmed;
     - a claim whose queue row is terminal is settled from that row:
       SUCCESS / REVOKED clears it, FAILURE marks it failed for a manual retry;
     - a claim whose queue row is gone is settled from its own completion
@@ -1614,7 +1514,7 @@ def reconcile_deep_pending_task():
         ' deep_claim_state, deep_completed_claim_id, deep_claim_detail,'
         ' COALESCE(deep_claimed_at, deep_pending_since)'
         ' FROM ' + table('results') +
-        ' WHERE deep_pending AND deep_eligible')
+        " WHERE deep_pending AND (deep_eligible OR deep_queue_backend = 'rq')")
     rows = cur.fetchall()
     cur.close()
 
@@ -1624,83 +1524,53 @@ def reconcile_deep_pending_task():
     def past_grace(since):
         return since is None or since < db_now - timedelta(hours=grace)
 
-    attached = {}   # backend -> [(item_id, claim_id, task_id, marker, detail)]
+    attached = []   # (item_id, claim_id, task_id, marker, detail, since)
     taskless = []   # (item_id, claim_id, since)
     for (item_id, claim_id, task_id, backend, _state, marker, detail,
          since) in rows:
+        if backend == 'rq':
+            # RQ no longer exists to be asked, so the claim cannot be settled
+            if _quarantine_legacy_backend(item_id, claim_id, backend):
+                counts['unknown'] += 1
+            continue
         if claim_id is None:
             counts['legacy'] += 1
             continue
         if task_id:
-            attached.setdefault(backend or _queue_backend(), []).append(
-                (item_id, claim_id, task_id, marker, detail, since))
+            attached.append((item_id, claim_id, task_id, marker, detail, since))
         else:
             taskless.append((item_id, claim_id, since))
 
-    for backend, claims in attached.items():
-        if backend == 'postgres':
-            states = _queue_states([task_id for _i, _c, task_id, _m, _d,
-                                    _s in claims])
-            if states is None:
-                counts['unreadable'] += len(claims)
-                continue
-            for item_id, claim_id, task_id, marker, _detail, since in claims:
-                qstate = states.get(task_id)
-                if qstate in (TASK_STATUS_PENDING, TASK_STATUS_STARTED,
-                              TASK_STATUS_PROGRESS):
-                    counts['live'] += 1
-                elif qstate in (TASK_STATUS_SUCCESS, TASK_STATUS_REVOKED):
-                    _reconcile_settle(item_id, claim_id, None)
-                    counts['settled'] += 1
-                elif qstate == TASK_STATUS_FAILURE:
-                    _reconcile_settle(item_id, claim_id, 'failed',
-                                      _claim_detail('failed',
-                                                    'queue task failed'))
-                    counts['settled'] += 1
-                elif marker == claim_id:
-                    # the child committed its completion but the clear never
-                    # landed; the gone row is retention, not a loss
-                    _reconcile_settle(item_id, claim_id, None)
-                    counts['settled'] += 1
-                elif past_grace(since):
-                    _reconcile_settle(
-                        item_id, claim_id, 'outcome_unknown',
-                        _claim_detail('outcome_unknown',
-                                      'queue row gone, no completion marker'))
-                    counts['unknown'] += 1
-                else:
-                    counts['live'] += 1
-        else:  # rq
-            for item_id, claim_id, task_id, marker, detail, since in claims:
-                qstate = _rq_job_state(task_id, _detail_queue(detail)
-                                       or 'default')
-                if qstate in ('queued', 'started', 'deferred'):
-                    counts['live'] += 1
-                elif qstate == 'finished':
-                    _reconcile_settle(item_id, claim_id, None)
-                    counts['settled'] += 1
-                elif qstate in ('stopped', 'canceled'):
-                    _reconcile_settle(item_id, claim_id, None)
-                    counts['settled'] += 1
-                elif qstate == 'failed':
-                    _reconcile_settle(item_id, claim_id, 'failed',
-                                      _claim_detail('failed',
-                                                    'queue task failed'))
-                    counts['settled'] += 1
-                elif qstate == 'missing':
-                    if marker == claim_id:
-                        _reconcile_settle(item_id, claim_id, None)
-                        counts['settled'] += 1
-                    elif past_grace(since):
-                        _reconcile_settle(
-                            item_id, claim_id, 'outcome_unknown',
-                            _claim_detail('outcome_unknown',
-                                          'queue job gone, no completion marker'))
-                        counts['unknown'] += 1
-                    else:
-                        counts['live'] += 1
-                else:  # None: a transport error is unreadable, not missing
-                    counts['unreadable'] += 1
+    # a row with no backend predates the column; every such claim is postgres
+    states = _queue_states([task_id for _i, _c, task_id, _m, _d, _s in attached])
+    if states is None:
+        counts['unreadable'] += len(attached)
+        attached = []
+    for item_id, claim_id, task_id, marker, _detail, since in attached:
+        qstate = states.get(task_id)
+        if qstate in (TASK_STATUS_PENDING, TASK_STATUS_STARTED,
+                      TASK_STATUS_PROGRESS):
+            counts['live'] += 1
+        elif qstate in (TASK_STATUS_SUCCESS, TASK_STATUS_REVOKED):
+            _reconcile_settle(item_id, claim_id, None)
+            counts['settled'] += 1
+        elif qstate == TASK_STATUS_FAILURE:
+            _reconcile_settle(item_id, claim_id, 'failed',
+                              _claim_detail('failed', 'queue task failed'))
+            counts['settled'] += 1
+        elif marker == claim_id:
+            # the child committed its completion but the clear never
+            # landed; the gone row is retention, not a loss
+            _reconcile_settle(item_id, claim_id, None)
+            counts['settled'] += 1
+        elif past_grace(since):
+            _reconcile_settle(
+                item_id, claim_id, 'outcome_unknown',
+                _claim_detail('outcome_unknown',
+                              'queue row gone, no completion marker'))
+            counts['unknown'] += 1
+        else:
+            counts['live'] += 1
 
     for item_id, claim_id, since in taskless:
         if past_grace(since):
@@ -1728,14 +1598,28 @@ def on_song_analyzed(song):
     try:
         if not get_setting('hook_enabled', True):
             return
-        native_id = song.get('item_id')  # v3: the NATIVE provider id
+        native_id = song.get('item_id')  # the native provider id
         path = song.get('audio_path')
         if not native_id or not path or not os.path.exists(path):
             return
-        # v3 attaches the canonical fp id (what score is keyed by) to the raw
-        # media item; on v2 it is absent and the native id IS the score key
+        # the server is resolved once, from the payload or else the active one
+        server_id = song.get('server_id') or _active_server_id()
+        # core attaches the canonical id score is keyed by to the media item as
+        # '_catalog_item_id' (core-internal, tasks/analysis/helper.py). Without
+        # it, the registry translates on the resolved server, and an unknown
+        # server is not guessed at: the default server would map the id as its own.
         media_item = song.get('media_item') or {}
-        item_id = str(media_item.get('_catalog_item_id') or native_id)
+        catalog_id = media_item.get('_catalog_item_id')
+        if catalog_id:
+            item_id = str(catalog_id)
+        elif server_id:
+            item_id = _native_to_fp([native_id], server_id).get(str(native_id))
+        else:
+            item_id = None
+        if not item_id:
+            logger.warning('spectrum_analyzer: no catalogue id for %s on server %s, '
+                           'hook skipped', native_id, server_id)
+            return
 
         # media_item is the raw provider track dict — the same shape the scans
         # fingerprint — so store the fingerprint a scan would compute and the
@@ -1760,7 +1644,7 @@ def on_song_analyzed(song):
         info = {
             'item_id': item_id,
             'provider_track_id': str(native_id),
-            'server_id': song.get('server_id'),
+            'server_id': server_id,
             'title': meta.get('title'),
             'artist': meta.get('artist') or meta.get('album_artist'),
             'album': meta.get('album') or meta.get('album_name'),
@@ -1775,9 +1659,8 @@ def on_song_analyzed(song):
             img_w=settings['img_w'], img_h=settings['img_h'],
             skip_spectrogram_for_clean=settings['skip_clean_spectrograms'],
         )
-        # (if the payload had no media_item — e.g. an older core — meta_fp is
-        # NULL and the next 'changed' scan downloads once, notices the MD5
-        # matches, and just backfills the fingerprint)
+        # (without a media_item, meta_fp is NULL: the next 'changed' scan
+        # downloads once, sees the MD5 match, and backfills the fingerprint)
         _upsert(item_id, info, result, meta_fp, md5)
     except Exception:
         logger.exception('spectrum_analyzer: on_song_analyzed failed')

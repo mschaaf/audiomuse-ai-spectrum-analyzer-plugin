@@ -1,10 +1,35 @@
 # Changelog
 
-## 0.4.0 — AudioMuse-AI 3.2–3.4 support
+## 0.4.0 — AudioMuse-AI 3.6.4
 
 AudioMuse-AI 3.2 replaced Redis/RQ with a task queue living in Postgres, and
-3.3.1 moved the core to numpy 2 and librosa 1.0. Both landed inside APIs this
-plugin builds on. Everything below still works on 2.6.2 and every 3.x.
+3.3.1 moved the core to numpy 2 and librosa 1.0. This release supports
+AudioMuse-AI 3.6.4 only and runs on the Postgres queue alone.
+
+### Support policy
+
+- Requires AudioMuse-AI 3.6.4 or newer (`min_core_version` 3.6.4). Cores older
+  than 3.6.4, including 2.x and the 3.x line before it, are no longer supported;
+  stay on 0.3.3 for them.
+- The RQ queue is no longer read. A deep-scan claim recorded against it is
+  quarantined as `outcome_unknown`, so it is only ever retried through the
+  explicit requeue action, which asks for confirmation first.
+
+### Ids and legacy claims
+
+- A track on a secondary server that the registry cannot map to a catalogue id
+  is counted as `unmapped` and skipped. It is never stored under its native id,
+  which `score` does not use. Native ids the registry returns for the default
+  server are still valid catalogue ids. The count is in the task details and
+  the log; no page renders it yet.
+- A registry failure fails the album, or skips it while the library scan plans
+  it, and is logged. It never falls back to native ids.
+- The `on_song_analyzed` hook keys its row by the core's catalogue id, resolves
+  one through the registry when the core does not supply it, and skips the track
+  when no id resolves.
+- Deep-scan claims on the retired RQ queue (`deep_queue_backend = 'rq'`) are
+  quarantined by the recovery cron whatever their completion marker says, since
+  nothing can confirm how they ended.
 
 ### The queue rewrite (core 3.2)
 
@@ -14,14 +39,12 @@ plugin builds on. Everything below still works on 2.6.2 and every 3.x.
   beside the queue's own, made the Cancel button tombstone a row nothing was
   polling (so cancelling a scan no longer stopped it launching more albums), and
   produced a `func IS NULL` row exposed to the core's stale-row sweep. Replaced
-  by `jobs._current_task_id()`, which asks `taskqueue.current_task_id()` first
-  and falls back to the RQ job id on older cores.
+  by `jobs._current_task_id()`, which reads `taskqueue.current_task_id()`.
 - **Lost album jobs are detected again.** `enqueue()` returns a task-id string
   on 3.2+ where it used to return an RQ `Job`, so the `job.get_status()` probe
   raised `AttributeError` into a bare `except` and silently never fired: a scan
   whose worker died drained forever waiting on a child that would never report.
-  `_child_job_lost` now polls the child's queue row on 3.2+ and keeps the RQ
-  path for older cores.
+  `_child_job_lost` now polls the child's queue row.
 - **A long backlog no longer ends a scan early.** The core fails any live task
   row it does not own once it has gone 30 minutes without an update. Album child
   rows are written once at launch, so a child waiting behind a big library was
@@ -74,7 +97,7 @@ plugin's own claim markers and never auto-retries an uncertain outcome.
 
 - **Each deep scan is owned by a claim.** Queuing a deep scan (per-track button
   or a bulk action) writes a distinct `deep_claim_id` plus the queued child's
-  id, the queue generation (`postgres`/`rq`), and a state
+  id, the queue it went into (`postgres`, or `rq` on the retired queue), and a state
   (`claimed`/`launched`/`running`/`failed`/`outcome_unknown`). Every deep-state
   write is fenced on that claim id, so a stale or superseded child can never
   clear a newer claim. `deep_pending` stays set for every active, failed,
@@ -103,7 +126,6 @@ plugin's own claim markers and never auto-retries an uncertain outcome.
 
 - `ANALYSIS_REV` bumped to 7 so rows stamped under r6 are re-analysed under the
   result-changing ffmpeg decode fallback.
-- RQ status lookup is conservative: only `NoSuchJobError` frees a throttle slot.
 - Overview confidence filtering preserves an explicit `max_conf=0`, treats an
   omitted/empty value as "no bound", and applies both bounds to one matching
   track.

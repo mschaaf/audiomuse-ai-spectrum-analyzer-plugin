@@ -161,9 +161,11 @@ constants behind the detection thresholds.
 ## Notes & caveats
 
 > [!IMPORTANT]
-> **AudioMuse-AI 3.0**: fully supported since plugin 0.3.0 (works on 2.6.2 too). v3 keys its `score` table by canonical fingerprint ids; the plugin translates native media-server ids at the edges and migrates existing data losslessly (FK `ON UPDATE CASCADE` rides the core's id relabel).
+> **Requires AudioMuse-AI 3.6.4 or newer.** Older cores (2.x and 3.0–3.5) are not supported; stay on plugin 0.3.3 for them. The core keys its `score` table by canonical ids; the plugin translates native media-server ids at the edges, and its rows follow the core's id relabel (FK `ON UPDATE CASCADE`).
 >
-> **Upgrading from 2.x: update the plugin *before* upgrading the core.** If your 3.0 upgrade appears stuck at boot with a foreign-key error mentioning `plugin_spectrum_analyzer__results`, update the plugin and Apply restart — the next boot completes the core migration with your plugin data intact. Multi-server installs: a manual library scan covers every configured server; re-analysis and deep scans download from the server that supplied the track; cron scans follow the schedule's server scope.
+> Multi-server installs: a manual library scan covers every configured server; re-analysis and deep scans download from the server that supplied the track; cron scans follow the schedule's server scope. A track that a server has but the catalogue does not map on that server is counted as `unmapped` in the scan's details and skipped, rather than analyzed under its native id.
+>
+> **Known limitation:** with a multi-server cron schedule, the scan marks its scheduled task finished after the first server, so later servers in the schedule's scope may not run. A manual scan covers every configured server.
 
 - **Only tracks already analyzed by core AudioMuse** get spectrum rows during a scan (the FK requires a `score` row). Un-analyzed tracks are counted as `not_in_score` and get picked up automatically by the hook when you run core analysis.
 - **Navidrome transcoding**: tracks are fetched via the Subsonic `stream` endpoint. Make sure the AudioMuse player/client in Navidrome has **no transcoding profile** ("raw"), otherwise you'd be analyzing the transcode, not the file.
