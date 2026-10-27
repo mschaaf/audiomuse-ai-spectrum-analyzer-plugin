@@ -139,7 +139,7 @@ class FakeCursor:
                          if parent == params[0] and t in TASK_ROWS]
         elif s.startswith('SELECT status FROM task_status'):
             self.rows = [(TASK_ROWS[params[0]],)] if params[0] in TASK_ROWS else []
-        elif s == 'SELECT now()':
+        elif s == 'SELECT now()::timestamp':
             self.rows = [(DB_NOW,)]
         elif s.startswith('SELECT item_id FROM score'):
             wanted = set(params[0]) if params else None

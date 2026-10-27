@@ -1507,7 +1507,9 @@ def reconcile_deep_pending_task():
     grace = _settings()['deep_pending_warning_hours']
     db = get_db()
     cur = db.cursor()
-    cur.execute('SELECT now()')
+    # the claim timestamps are naive TIMESTAMP columns; compare against a
+    # naive now() (same session-timezone conversion), not a tz-aware one
+    cur.execute('SELECT now()::timestamp')
     db_now = cur.fetchone()[0]
     cur.execute(
         'SELECT item_id, deep_claim_id, deep_task_id, deep_queue_backend,'
