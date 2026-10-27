@@ -31,6 +31,19 @@ AudioMuse-AI 3.6.4 only and runs on the Postgres queue alone.
   quarantined by the recovery cron whatever their completion marker says, since
   nothing can confirm how they ended.
 
+### Verification
+
+- Run on a live AudioMuse-AI 3.6.4 (Postgres 15, Navidrome): install and
+  migration, incremental and forced scans, the `on_song_analyzed` hook (one
+  correctly keyed row per analyzed track), a deep scan through its whole claim
+  lifecycle, the recovery cron quarantining seeded `rq` claims, and cancelling a
+  scan mid-flight. Not run: a multi-server core, and the single-album and
+  per-track rescan buttons.
+- `tests/test_postgres_integration.py` runs the migration and the claim,
+  quarantine and reconciler SQL against a real Postgres (opt-in via
+  `SA_TEST_PG_DSN`). It caught a tz-aware/naive comparison in the recovery
+  cron's grace check, fixed before release.
+
 ### The queue rewrite (core 3.2)
 
 - **Scan task rows follow the core's id again.** `jobs._rq_task_id()` read the
