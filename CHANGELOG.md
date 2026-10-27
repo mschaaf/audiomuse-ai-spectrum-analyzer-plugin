@@ -1,5 +1,153 @@
 # Changelog
 
+## 0.4.0 — AudioMuse-AI 3.6.4
+
+AudioMuse-AI 3.2 replaced Redis/RQ with a task queue living in Postgres, and
+3.3.1 moved the core to numpy 2 and librosa 1.0. This release supports
+AudioMuse-AI 3.6.4 only and runs on the Postgres queue alone.
+
+### Support policy
+
+- Requires AudioMuse-AI 3.6.4 or newer (`min_core_version` 3.6.4). Cores older
+  than 3.6.4, including 2.x and the 3.x line before it, are no longer supported;
+  stay on 0.3.3 for them.
+- The RQ queue is no longer read. A deep-scan claim recorded against it is
+  quarantined as `outcome_unknown`, so it is only ever retried through the
+  explicit requeue action, which asks for confirmation first.
+
+### Ids and legacy claims
+
+- A track on a secondary server that the registry cannot map to a catalogue id
+  is counted as `unmapped` and skipped. It is never stored under its native id,
+  which `score` does not use. Native ids the registry returns for the default
+  server are still valid catalogue ids. The count is in the task details and
+  the log; no page renders it yet.
+- A registry failure fails the album, or skips it while the library scan plans
+  it, and is logged. It never falls back to native ids.
+- The `on_song_analyzed` hook keys its row by the core's catalogue id, resolves
+  one through the registry when the core does not supply it, and skips the track
+  when no id resolves.
+- Deep-scan claims on the retired RQ queue (`deep_queue_backend = 'rq'`) are
+  quarantined by the recovery cron whatever their completion marker says, since
+  nothing can confirm how they ended.
+
+### Verification
+
+- Run on a live AudioMuse-AI 3.6.4 (Postgres 15, Navidrome): install and
+  migration, incremental and forced scans, the `on_song_analyzed` hook (one
+  correctly keyed row per analyzed track), a deep scan through its whole claim
+  lifecycle, the recovery cron quarantining seeded `rq` claims, and cancelling a
+  scan mid-flight. Not run: a multi-server core, and the single-album and
+  per-track rescan buttons.
+- `tests/test_postgres_integration.py` runs the migration and the claim,
+  quarantine and reconciler SQL against a real Postgres (opt-in via
+  `SA_TEST_PG_DSN`). It caught a tz-aware/naive comparison in the recovery
+  cron's grace check, fixed before release.
+
+### The queue rewrite (core 3.2)
+
+- **Scan task rows follow the core's id again.** `jobs._rq_task_id()` read the
+  running RQ job's id; `rq` is not installed from 3.2, so it returned `None` and
+  every scan invented a uuid instead. That left a second row in Active Tasks
+  beside the queue's own, made the Cancel button tombstone a row nothing was
+  polling (so cancelling a scan no longer stopped it launching more albums), and
+  produced a `func IS NULL` row exposed to the core's stale-row sweep. Replaced
+  by `jobs._current_task_id()`, which reads `taskqueue.current_task_id()`.
+- **Lost album jobs are detected again.** `enqueue()` returns a task-id string
+  on 3.2+ where it used to return an RQ `Job`, so the `job.get_status()` probe
+  raised `AttributeError` into a bare `except` and silently never fired: a scan
+  whose worker died drained forever waiting on a child that would never report.
+  `_child_job_lost` now polls the child's queue row.
+- **A long backlog no longer ends a scan early.** The core fails any live task
+  row it does not own once it has gone 30 minutes without an update. Album child
+  rows are written once at launch, so a child waiting behind a big library was
+  failed out from under the parent, counted done, and the scan reported finished
+  while the album was still queued. `_touch_live_children` refreshes the rows
+  that actually approach the deadline.
+- **Bulk actions work again.** The 3.2 queue guard counts live plugin tasks, not
+  just core ones, so the first track a route queued blocked the second: every bulk
+  button — Deep scan all non-CLEAN, Force re-queue, bulk selected, album
+  re-analyze without an album id — would have queued exactly one track. They now
+  start a single orchestrator task (`bulk_analyze_job`) that claims the tracks and
+  feeds them onto the default queue from inside a worker, capped at
+  `MAX_QUEUED_ANALYSIS_JOBS` in flight, reporting tracks done/remaining under
+  Active Tasks — the same shape the library scan uses for albums. Cancelling it
+  untags whatever it claimed but never launched. The overview's green
+  "Queued N deep scans" banner becomes "started — follow progress under Active
+  Tasks", because N is now decided when the job starts, not when you click.
+  The orphan-recovery cron feeds its backlog through the same throttle.
+- **Buttons explain a busy queue instead of returning 500.** From 3.2 the core
+  refuses a plugin enqueue issued from the web process while another queue job
+  is running. Scan, Re-analyze, Deep analyze, the bulk actions and Re-analyze
+  album now report that and stop, and the deep-scan buttons undo the
+  "deep scan queued" tag they had already written, so a refused click can no
+  longer leave a track stuck until the orphan-recovery TTL. Force-requeue only
+  bumps `deep_pending_since` for rows that actually reached the queue, so a row
+  it could not queue stays visible to the recovery cron.
+
+### The dependency bump (core 3.3.1)
+
+- **Deep scans of m4a/mp4/ALAC/opus/wma work again.** librosa 1.0 removed the
+  audioread backend, so `librosa.load` reads only what libsndfile can open.
+  Normal scans already had an ffmpeg tier for those containers; deep scans had
+  none and died on their first chunk — a deep scan of an ALAC `.m4a` came back
+  INCONCLUSIVE. Both the deep scan and the single-window fallback now fall back
+  to ffmpeg. The fallback is deliberately limited to containers libsndfile
+  cannot open at all: for a corrupt FLAC, the decode failure is the finding, and
+  ffmpeg decoding its intact prefix would launder that into a verdict.
+- **matplotlib floor raised to `>=3.10`** for the core's numpy 2.4.6. matplotlib
+  3.8's C extensions are built against the numpy 1.x ABI and fail to import
+  under numpy 2, and pip does not upgrade an already-satisfied requirement.
+
+### Queue-aware deep-scan recovery
+
+The deep-scan "pending" tag was previously recovered by age alone: a track
+still tagged after the orphan TTL was re-queued. That treated time as proof a
+child was lost, which is wrong now that the queue lives in Postgres — the core
+persists queued work and reclaims work whose worker died, so a restart needs no
+plugin intervention. Recovery is now a bounded reconciler that only settles the
+plugin's own claim markers and never auto-retries an uncertain outcome.
+
+- **Each deep scan is owned by a claim.** Queuing a deep scan (per-track button
+  or a bulk action) writes a distinct `deep_claim_id` plus the queued child's
+  id, the queue it went into (`postgres`, or `rq` on the retired queue), and a state
+  (`claimed`/`launched`/`running`/`failed`/`outcome_unknown`). Every deep-state
+  write is fenced on that claim id, so a stale or superseded child can never
+  clear a newer claim. `deep_pending` stays set for every active, failed,
+  unknown and legacy claim, so the existing boolean deep controls keep
+  disabling; retry eligibility is now state-aware.
+- **A failed launch no longer strands tags.** A bulk launch failure
+  (`_LaunchFailed`) cleans only the never-enqueued normal claims and restores
+  the prior record for never-enqueued force-requeue claims (compare-and-set on
+  the fresh claim id), then re-raises the original cause so the parent task
+  stays FAILURE.
+- **The recovery cron is a reconciler, not a retryer.** `recover_deep_pending`
+  (name kept, so existing enabled schedules keep working) reads each owned
+  claim's real queue state and only settles the plugin's markers: a confirmed
+  success or cancel clears the claim, a confirmed failure marks it `failed`,
+  and a missing/unreadable row or a task-less claim past the warning grace
+  becomes `outcome_unknown`. It never re-queues. A retry is always an explicit
+  user action — failed claims use the normal confirmed retry, unknown/task-less
+  claims require a separately labelled "retry despite unknown outcome"
+  confirmation that warns duplicate work may occur, and live/unreadable claims
+  have no retry control.
+- **The TTL setting is now a warning.** `deep_orphan_ttl_hours` is renamed
+  `deep_pending_warning_hours` (value migrated); it only warns about stale
+  claims and never selects work for enqueue.
+
+### Branch remediation
+
+- `ANALYSIS_REV` bumped to 7 so rows stamped under r6 are re-analysed under the
+  result-changing ffmpeg decode fallback.
+- Overview confidence filtering preserves an explicit `max_conf=0`, treats an
+  omitted/empty value as "no bound", and applies both bounds to one matching
+  track.
+
+### Also
+
+- Album and library overviews gained a **max confidence %** filter alongside the
+  existing minimum, and every verdict chip now shows how many tracks match it.
+
 ## 0.3.1
 
 - Self-healing provider-id backfill: library and album scans re-run the

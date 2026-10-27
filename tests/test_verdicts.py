@@ -671,6 +671,45 @@ class TestAdversarialFixtures(unittest.TestCase):
         self.assertEqual(d_alac['delivery']['codec'], 'alac')
         self.assertIn('codec_mismatch', d_alac['delivery'])
 
+    @unittest.skipUnless(__import__('shutil').which('ffmpeg'), 'requires ffmpeg on PATH')
+    def test_deep_scan_of_non_native_container_decodes_via_ffmpeg(self):
+        # librosa 1.0 (AudioMuse-AI 3.3.1+) removed the audioread backend, so
+        # librosa.load reads only what libsndfile can open -- which is exactly
+        # what the soundfile-only librosa_stub already does here. Segment mode
+        # has had an ffmpeg window tier since 0.6.0; deep mode used to have
+        # none, so a deep scan of any m4a/mp4/opus-in-mp4/wma died on its first
+        # chunk and came back INCONCLUSIVE. It must decode for real instead.
+        for name, kbps in (('lossless_alac.m4a', 900), ('lossy_aac_256.m4a', 256)):
+            with self.subTest(fixture=name):
+                r = _analyze(name, 'm4a', kbps, deep=True)
+                self.assertNotEqual(r['verdict'], 'INCONCLUSIVE')
+                self.assertTrue(r['deep_eligible'])
+                d = json.loads(r['details'])
+                self.assertEqual(d['integrity']['status'], 'full_decode_ok')
+                self.assertTrue(d['deep'])
+                # a real decode, not an empty one dressed up as success
+                self.assertGreater(r['cutoff_hz'], 15000)
+
+    def test_ffmpeg_tier_never_rescues_a_corrupt_native_container(self):
+        # the gate on the fallback: for a container libsndfile CAN open, a
+        # librosa failure is the finding (corruption), not the wrong decoder.
+        # Handing truncated.flac to ffmpeg would decode its intact prefix and
+        # launder a decode failure into a verdict.
+        r = _analyze('truncated.flac', 'flac', 900, deep=True)
+        self.assertEqual(r['verdict'], 'INCONCLUSIVE')
+        self.assertEqual(json.loads(r['details'])['integrity'],
+                         {'status': 'decode_failed', 'coverage': None})
+
+    def test_load_segment_only_tries_ffmpeg_for_non_seekable_containers(self):
+        # _load_segment keeps its librosa-only contract unless the caller has
+        # actually established that libsndfile cannot open the file, so a
+        # direct call (and every pre-existing caller) behaves as before.
+        missing = os.path.join(FIXTURES, 'does_not_exist.m4a')
+        for native_seekable in (None, True):
+            with self.subTest(native_seekable=native_seekable):
+                with self.assertRaises(ValueError):
+                    dsp._load_segment(missing, 45, native_seekable)
+
 
 class TestPhase1b(unittest.TestCase):
     """Segment-mode verdict wiring (IMPROVEMENT_PLAN.md Phase 1b): the
