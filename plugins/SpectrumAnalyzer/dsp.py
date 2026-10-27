@@ -1163,13 +1163,8 @@ def analyze_file(path, suffix=None, bitrate_kbps=None, segment_seconds=90,
                                           segment_seconds, dsd_fmt)
 
     detected_fmt, detected_lossless, codec_name = _probe_container(path)
-    # Ogg Opus is an ffmpeg-tier container (see _load_windows), but
-    # libsndfile 1.2.2 *opens* it, so tier 2 claims it as natively
-    # seekable. It can only decode parts of such a file: a window read
-    # raises "Supported file format but file is malformed" at some
-    # offsets and returns audio at others, which costs the track its
-    # verdict (INCONCLUSIVE) or bases one on whichever fragment
-    # decoded. Opening is not decoding, so keep opus off this tier.
+    # libsndfile opens Ogg Opus but decodes it only in parts, so it stays on
+    # the ffmpeg tier even though tier 2 reports a format for it.
     native_seekable = detected_fmt is not None and codec_name != 'opus'
 
     ffprobe_info = None
